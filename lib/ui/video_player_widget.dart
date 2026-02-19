@@ -39,6 +39,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   bool _initialized = false;
   bool _showPlayIcon = false;
   bool _isBuffering = false;
+  bool _widgetDisposed = false; // guard against post-dispose callbacks
   Timer? _iconTimer;
 
   @override
@@ -144,24 +145,50 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   }
 
   void _onControllerUpdate() {
-      if (!mounted) return;
-      final isBuffering = _controller?.value.isBuffering ?? false;
-      if (isBuffering != _isBuffering) {
-          debugPrint('[VideoPlayer] ⏳ Buffering changed for ${widget.index}: $isBuffering');
-          setState(() => _isBuffering = isBuffering);
+      if (!mounted || _widgetDisposed) return;
+      final ctrl = _controller;
+      if (ctrl == null) return;
+      // Guard: controller may have been disposed by pool eviction
+      try {
+        final isBuffering = ctrl.value.isBuffering;
+        if (isBuffering != _isBuffering) {
+            debugPrint('[VideoPlayer] ⏳ Buffering changed for ${widget.index}: $isBuffering');
+            setState(() => _isBuffering = isBuffering);
+        }
+      } catch (_) {
+        // Controller was disposed externally — detach and clear
+        _clearDisposedController();
+      }
+  }
+
+  void _clearDisposedController() {
+      try { _controller?.removeListener(_onControllerUpdate); } catch (_) {}
+      if (mounted && !_widgetDisposed) {
+        setState(() {
+          _controller = null;
+          _initialized = false;
+          _isBuffering = false;
+        });
       }
   }
 
   /// iOS Fix: Seek to current position before playing to force texture refresh.
   Future<void> _safePlay() async {
-    if (_controller == null) return;
+    if (_controller == null || _widgetDisposed) return;
     
-    // Force a seek to refresh texture (especially on iOS)
-    final pos = _controller!.value.position;
-    if (pos > Duration.zero) {
-        await _controller!.seekTo(pos);
+    // Guard: controller might be disposed by pool eviction between frames
+    try {
+      final pos = _controller!.value.position;
+      if (pos > Duration.zero) {
+          await _controller!.seekTo(pos);
+      }
+      if (!_widgetDisposed && _controller != null) {
+        await _controller!.play();
+      }
+    } catch (e) {
+      debugPrint('[VideoPlayer] _safePlay error (disposed?): $e');
+      _clearDisposedController();
     }
-    await _controller!.play();
   }
 
   @override
@@ -183,10 +210,12 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
 
   @override
   void dispose() {
+    _widgetDisposed = true;
     _iconTimer?.cancel();
-    _controller?.removeListener(_onControllerUpdate);
+    // Remove listener BEFORE clearing reference
+    try { _controller?.removeListener(_onControllerUpdate); } catch (_) {}
+    _controller = null;
     // Do NOT call _controller.dispose().
-    // Instead, release it back to the pool management (or just let it sit in LRU).
     // The pool handles disposal when it gets full.
     super.dispose();
   }

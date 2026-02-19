@@ -15,7 +15,7 @@ class VideoData {
       url: 'http://playertest.longtailvideo.com/adaptive/wowzaid3/playlist.m3u8',
       title: 'Wowza ID3',
     ),
-   
+
     VideoData(
       url: 'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8',
       title: 'Tears of Steel',

@@ -200,6 +200,8 @@ class SegmentCache {
     final tmpFile = File(tmpPath);
 
     try {
+      // Ensure the cache directory still exists (OS may wipe temp dirs)
+      await Directory(_cacheDir).create(recursive: true);
       // Atomic write: Write to .tmp then rename
       await tmpFile.writeAsBytes(data, flush: true);
       await tmpFile.rename(path);
