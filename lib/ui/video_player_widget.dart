@@ -3,8 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
-import '../core/hls/hls_cache_manager.dart';
 import '../core/video/video_controller_pool.dart';
+import '../core/services/logger_service.dart';
 
 /// Plays a single HLS video via the local caching proxy.
 ///
@@ -34,12 +34,17 @@ class VideoPlayerWidget extends StatefulWidget {
   State<VideoPlayerWidget> createState() => _VideoPlayerWidgetState();
 }
 
-class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKeepAliveClientMixin {
+class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   VideoPlayerController? _controller;
   bool _initialized = false;
   bool _showPlayIcon = false;
   bool _isBuffering = false;
   bool _widgetDisposed = false; // guard against post-dispose callbacks
+  bool _hasError = false;       // true after init failure — shows retry UI
+  /// True if the controller was just restored from a saved position
+  /// (e.g. from pool eviction, or app backgrounding).
+  /// Triggers a one-time seekTo in _safePlay.
+  bool _isRestored = false;
   Timer? _iconTimer;
 
   @override
@@ -52,54 +57,77 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tryInitialize();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _initialized && widget.shouldPlay) {
+      // On resume, we force a seek to current position.
+      // This is the FIX for the iOS black screen / frozen texture issue.
+      _isRestored = true; 
+      _safePlay();
+    }
+  }
+
   void _tryInitialize() {
-    // Lazy Init: Only initialize if we are within range.
-    // VideoControllerPool handles memory, so we can be slightly more aggressive (distance 2),
-    // but sticking to 1 is safer for CPU (decoders).
     final distance = (widget.index - widget.currentIndex).abs();
-    
-    // If out of range, release reference to controller so the Pool can recycle it
-    // and we don't hold onto a potentially disposed object (if evicted).
-    if (distance > 1) {
-        if (_controller != null) {
-            setState(() {
-              _controller = null;
-              _initialized = false;
-            });
-        }
-        return;
+
+    // ── Distance guard: too far away, release reference so pool can evict ──
+    if (distance > 2) {
+      if (_controller != null) {
+        setState(() {
+          _controller = null;
+          _initialized = false;
+        });
+      }
+      return;
     }
 
-    // OPTIMIZATION: Try to get controller SYNCHRONOUSLY to avoid 1-frame loader
-    // This pairs with the Splash Screen pre-warming.
+    // ── ✅ Fast-path: widget already has a healthy controller ──────────────
+    if (_initialized && _controller != null) {
+      try {
+        if (_controller!.value.isInitialized) {
+          if (widget.index == widget.currentIndex) {
+            VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+          }
+          if (widget.shouldPlay) _safePlay();
+          return;
+        }
+      } catch (_) {
+        _controller?.removeListener(_onControllerUpdate);
+        _controller = null;
+        _initialized = false;
+      }
+    }
+
+    // ── Sync path: controller already in pool ─────────────────────────────
     final existing = VideoControllerPool.instance.getControllerNow(widget.videoUrl);
-    if (existing != null) {
-        debugPrint('[VideoPlayer] ⚡️ Instant synchronous init for ${widget.index}');
-        _controller = existing;
-        _initialized = true;
-        
-        // Attach listeners immediately
-        _controller!.addListener(_onControllerUpdate);
-        
-        // Prevent eviction
-        if (widget.index == widget.currentIndex) {
-             VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
-        }
+    if (existing != null && existing.value.isInitialized) {
+      debugPrint('[VideoPlayer] ⚡️ Instant synchronous init for ${widget.index}');
 
-        if (widget.shouldPlay) {
-             _safePlay(); // Fire and forget (it's already ready)
-        }
-        return; 
+      _controller?.removeListener(_onControllerUpdate);
+
+      _controller = existing;
+      _initialized = true;
+      _isRestored = true; // Mark for seek restoration
+      existing.setLooping(true);
+      _controller!.addListener(_onControllerUpdate);
+
+      if (widget.index == widget.currentIndex) {
+        VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+      }
+      if (widget.shouldPlay) _safePlay();
+      return;
     }
 
+    // ── Async path: controller not yet in pool — initialise it ────────────
     _initPlayer();
   }
 
   Future<void> _initPlayer() async {
-    if (_initialized || _controller != null) return; 
+    if (_initialized && _controller != null) return;
     
     // Capture the target URL at the START of the async operation.
     final targetUrl = widget.videoUrl;
@@ -130,6 +158,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       setState(() {
         _controller = controller;
         _initialized = true;
+        _isRestored = true; // Mark for seek restoration
       });
 
       // Listen for buffering changes
@@ -141,6 +170,9 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       }
     } catch (e) {
       debugPrint('[VideoPlayer] init failed for $targetUrl: $e');
+      if (mounted && !_widgetDisposed) {
+        setState(() => _hasError = true);
+      }
     }
   }
 
@@ -161,27 +193,47 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       }
   }
 
-  void _clearDisposedController() {
-      try { _controller?.removeListener(_onControllerUpdate); } catch (_) {}
-      if (mounted && !_widgetDisposed) {
-        setState(() {
-          _controller = null;
-          _initialized = false;
-          _isBuffering = false;
-        });
-      }
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _iconTimer?.cancel();
+    _widgetDisposed = true;
+    _controller?.removeListener(_onControllerUpdate);
+    super.dispose();
   }
 
-  /// iOS Fix: Seek to current position before playing to force texture refresh.
+  void _clearDisposedController() {
+    try { _controller?.removeListener(_onControllerUpdate); } catch (_) {}
+    if (mounted && !_widgetDisposed) {
+      setState(() {
+        _controller = null;
+        _initialized = false;
+        _isBuffering = false;
+      });
+    }
+  }
+
+  /// Safe play with targeted iOS texture-refresh seek.
+  ///
+  /// Restore position ONLY if we just attached or app resumed.
+  /// This is the "Loader-Free" optimization: by skipping seekTo on normal
+  /// back-scroll, we avoid hitting ExoPlayer's buffer state, making playback
+  /// resume instantly.
   Future<void> _safePlay() async {
     if (_controller == null || _widgetDisposed) return;
-    
-    // Guard: controller might be disposed by pool eviction between frames
+
     try {
-      final pos = _controller!.value.position;
-      if (pos > Duration.zero) {
+      // Restore position ONLY if we just attached or app resumed.
+      // Skipping this on normal back-scroll fixes the loader flash.
+      if (_isRestored) {
+        final pos = _controller!.value.position;
+        if (pos > const Duration(seconds: 1)) {
+          LoggerService.d('[VideoPlayer] 🔄 Restoring position to ${pos.inSeconds}s (Seek)');
           await _controller!.seekTo(pos);
+        }
+        _isRestored = false;
       }
+
       if (!_widgetDisposed && _controller != null) {
         await _controller!.play();
       }
@@ -206,18 +258,6 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
     if (widget.shouldPlay != oldWidget.shouldPlay && _initialized) {
       widget.shouldPlay ? _safePlay() : _controller?.pause();
     }
-  }
-
-  @override
-  void dispose() {
-    _widgetDisposed = true;
-    _iconTimer?.cancel();
-    // Remove listener BEFORE clearing reference
-    try { _controller?.removeListener(_onControllerUpdate); } catch (_) {}
-    _controller = null;
-    // Do NOT call _controller.dispose().
-    // The pool handles disposal when it gets full.
-    super.dispose();
   }
 
   // -------------------------------------------------------------------------
@@ -265,8 +305,38 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
                   ),
                 ),
               )
+            else if (_hasError)
+              // Error state — shown when init fails (network error / offline)
+              Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.wifi_off_rounded, color: Colors.white54, size: 48),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'Could not load video',
+                      style: TextStyle(color: Colors.white54, fontSize: 14),
+                    ),
+                    const SizedBox(height: 16),
+                    TextButton.icon(
+                      onPressed: () {
+                        setState(() => _hasError = false);
+                        _initPlayer();
+                      },
+                      icon: const Icon(Icons.refresh_rounded, color: Colors.white70),
+                      label: const Text('Retry', style: TextStyle(color: Colors.white70)),
+                      style: TextButton.styleFrom(
+                        backgroundColor: Colors.white12,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              )
             else
-              // Placeholder while initializing (prevents black flash)
+              // Placeholder while initializing
               Container(
                 color: Colors.grey[900],
                 child: const Center(

@@ -21,7 +21,22 @@ class ProxyServer {
   // Dependencies
   // ---------------------------------------------------------------------------
   final SegmentCache cache;
-  final http.Client _httpClient = http.Client();
+
+  /// Pool of 4 HTTP clients for parallel requests without head-of-line blocking.
+  /// Each client maintains its own connection pool to the CDN.
+  static const int _clientPoolSize = 4;
+  final List<http.Client> _clientPool =
+      List.generate(_clientPoolSize, (_) => http.Client());
+  int _clientIndex = 0;
+
+  /// Returns the next client from the round-robin pool.
+  http.Client get _nextClient {
+    final client = _clientPool[_clientIndex % _clientPoolSize];
+    _clientIndex++;
+    return client;
+  }
+
+  ProxyServer({required this.cache});
 
   // ---------------------------------------------------------------------------
   // State
@@ -32,7 +47,13 @@ class ProxyServer {
   /// Track in-flight downloads → prevents redundant fetches.
   final Map<String, Completer<Uint8List>> _inFlightDownloads = {};
 
-  ProxyServer({required this.cache});
+  /// In-memory cache for rewritten manifests.
+  /// HLS players request manifests frequently (every few seconds for live/sliding windows).
+  /// Serving from memory eliminates disk I/O latency and ensures zero-delay playback starts.
+  final Map<String, Uint8List> _manifestCache = {};
+
+  /// In-memory cache for segment URL lists (used by PreloadManager).
+  final Map<String, List<String>> _segmentListCache = {};
 
   // ---------------------------------------------------------------------------
   // Lifecycle
@@ -51,7 +72,9 @@ class ProxyServer {
 
   Future<void> stop() async {
     await _server?.close(force: true);
-    _httpClient.close();
+    for (final client in _clientPool) {
+      client.close();
+    }
   }
 
   /// Build the proxy URL the video player should load for a given HLS
@@ -108,10 +131,18 @@ class ProxyServer {
   Future<void> _handleManifest(HttpRequest request, String url) async {
     final cacheKey = 'manifest:$url';
 
-    // 1. Serve from cache
+    // 1. Serve from memory cache (Fastest)
+    if (_manifestCache.containsKey(cacheKey)) {
+      LoggerService.d('[ProxyServer] 🚀 Serving MANIFEST from MEMORY: $url');
+      _writeManifestResponse(request, _manifestCache[cacheKey]!);
+      return;
+    }
+
+    // 2. Serve from disk cache (Fallback)
     final cached = await cache.get(cacheKey);
     if (cached != null) {
-      LoggerService.i('[ProxyServer] 📦 Serving MANIFEST from OFFLINE CACHE: $url');
+      LoggerService.i('[ProxyServer] 📦 Serving MANIFEST from DISK: $url');
+      _manifestCache[cacheKey] = cached; // Promote to memory
       _writeManifestResponse(request, cached);
       return;
     }
@@ -200,11 +231,14 @@ class ProxyServer {
 
   String _segmentContentType(String url) {
     final lower = url.toLowerCase();
-    if (lower.contains('.m4s') || lower.contains('.mp4') || lower.contains('.m4v') || lower.contains('.m4a')) {
+    if (lower.contains('.m4s') || lower.contains('.mp4') ||
+        lower.contains('.m4v') || lower.contains('.m4a') ||
+        lower.contains('.fmp4') || lower.contains('.cmfv') ||
+        lower.contains('.cmfa')) {
       return 'video/mp4';
     }
     if (lower.contains('.aac')) return 'audio/aac';
-    return 'video/MP2T'; // .ts default
+    return 'video/MP2T'; // .ts / .ts?params default
   }
 
   // ---------------------------------------------------------------------------
@@ -266,7 +300,12 @@ class ProxyServer {
   Future<List<String>> downloadAndCacheManifest(String url) async {
     final cacheKey = 'manifest:$url';
 
-    // Already cached? Re-parse from original to extract segment URLs.
+    // 1. Memory cache hit
+    if (_segmentListCache.containsKey(url)) {
+      return _segmentListCache[url]!;
+    }
+
+    // 2. Disk cache hit
     final cached = await cache.get(cacheKey);
     if (cached != null) {
       // We already have the rewritten manifest; try to get the segment list
@@ -297,7 +336,8 @@ class ProxyServer {
       result = ManifestParser.parseMasterPlaylist(content, url, baseUrl);
       final rewritten =
           Uint8List.fromList(utf8.encode(result.rewrittenContent));
-      await cache.put(cacheKey, rewritten);
+      _manifestCache[cacheKey] = rewritten; // Cache in memory
+      await cache.put(cacheKey, rewritten); // And disk
 
       // Pick first (lowest-bandwidth) variant for pre-loading
       if (result.variantUrls.isNotEmpty) {
@@ -308,8 +348,12 @@ class ProxyServer {
       result = ManifestParser.parseMediaPlaylist(content, url, baseUrl);
       final rewritten =
           Uint8List.fromList(utf8.encode(result.rewrittenContent));
+      _manifestCache[cacheKey] = rewritten; // Cache in memory
       await cache.put(cacheKey, rewritten);
-      return result.segmentUrls;
+      
+      final urls = result.segmentUrls;
+      _segmentListCache[url] = urls; // Cache list in memory
+      return urls;
     }
   }
 
@@ -317,16 +361,19 @@ class ProxyServer {
   // HTTP helper
   // ---------------------------------------------------------------------------
 
+  /// Downloads [url] with timeout, retry, and exponential backoff.
+  /// Uses a fresh client from the pool so large downloads don't block other requests.
   Future<Uint8List?> _downloadWithTimeout(
     String url, {
-    Duration timeout = const Duration(seconds: 15),
-    int retries = 3,
+    Duration timeout = const Duration(seconds: 8),
+    int retries = 2,
   }) async {
+    // Use round-robin pool client for this request
+    final client = _nextClient;
     int attempt = 0;
     while (attempt < retries) {
       if (attempt > 0) {
-        // Exponential backoff: 500ms, 1000ms, 2000ms
-        final backoff = Duration(milliseconds: 500 * (1 << (attempt - 1)));
+        final backoff = Duration(milliseconds: 300 * (1 << (attempt - 1)));
         LoggerService.w('[ProxyServer] Retrying ($attempt/$retries) for $url after ${backoff.inMilliseconds}ms');
         await Future.delayed(backoff);
       }
@@ -335,10 +382,12 @@ class ProxyServer {
       final start = DateTime.now();
       try {
         LoggerService.d('[ProxyServer] Download Attempt $attempt: $url');
-        final response = await _httpClient.get(
+        final response = await client.get(
           Uri.parse(url),
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          headers: const {
+            'User-Agent': 'Mozilla/5.0 (compatible; HLSProxy/1.0)',
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
           },
         ).timeout(timeout);
 

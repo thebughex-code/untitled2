@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../core/hls/hls_cache_manager.dart';
 import '../core/hls/video_preload_manager.dart';
 import '../core/models/video_data.dart';
+import '../core/services/logger_service.dart';
 import '../core/video/video_controller_pool.dart';
 import 'video_feed_screen.dart';
 
@@ -28,39 +29,19 @@ class _SplashScreenState extends State<SplashScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
-    _bootstrap();
+    _start();
   }
 
-  Future<void> _bootstrap() async {
-    try {
-      // 1. Spin up local proxy + disk cache
-      await HlsCacheManager.instance.init();
-
-      // 2. Pre-load the first 4 videos (manifest + first 5 sec segments)
-      final urls = VideoData.videos.map((v) => v.url).toList();
-      await VideoPreloadManager.instance
-          .preloadInitialBatch(urls, count: 4)
-          .timeout(
-            const Duration(seconds: 10),
-            onTimeout: () {
-              debugPrint('[Splash] preload timed out, continuing…');
-            },
-          );
-
-      // 3. WARM UP THE CONTROLLER (The Critical Fix)
-      // Initialize the player for the very first video RIGHT NOW.
-      // This absorbs the "loader" time into the splash screen.
-      if (urls.isNotEmpty) {
-        debugPrint('[Splash] 🚀 Warming up first controller: ${urls.first}');
-        await VideoControllerPool.instance.getControllerFor(urls.first);
-      }
-    } catch (e) {
-      debugPrint('[Splash] bootstrap error: $e');
-    }
-
+  /// Runs bootstrap work and a minimum branding delay in parallel,
+  /// then navigates when both are done.
+  Future<void> _start() async {
+    await Future.wait([
+      _bootstrap(),
+      // Guarantee the logo is visible for at least 1.5 s on fast devices.
+      Future.delayed(const Duration(milliseconds: 1500)),
+    ]);
     if (!mounted) return;
-
-    // 3. Navigate to the video feed (no back-stack)
+    LoggerService.d('[Splash] 🚀 Navigating to VideoFeedScreen');
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
         pageBuilder: (_, a, b) => const VideoFeedScreen(),
@@ -68,6 +49,77 @@ class _SplashScreenState extends State<SplashScreen>
             FadeTransition(opacity: animation, child: child),
         transitionDuration: const Duration(milliseconds: 400),
       ),
+    );
+  }
+
+  /// Initialises the HLS cache and preloads the first 3 videos.
+  /// Navigation is handled by [_start] so this method purely does work.
+  Future<void> _bootstrap() async {
+    final bootstrapStart = DateTime.now();
+    LoggerService.i('[Splash] ▶️ Bootstrap started');
+
+    try {
+      // Step 1: HLS proxy + disk cache
+      LoggerService.d('[Splash] 1/3 Initialising HlsCacheManager…');
+      final hlsStart = DateTime.now();
+      await HlsCacheManager.instance.init();
+      LoggerService.i(
+        '[Splash] ✅ HlsCacheManager ready '
+        '(${DateTime.now().difference(hlsStart).inMilliseconds} ms)',
+      );
+
+      final urls = VideoData.videos.map((v) => v.url).toList();
+      if (urls.isEmpty) return;
+
+      // Steps 2 & 3: segment preload + controller warm-up run concurrently.
+      LoggerService.d('[Splash] 2+3 Parallel: preload 3 videos + warm-up controllers 0 & 1…');
+      final parallelStart = DateTime.now();
+
+      bool timedOut = false;
+      await Future.wait([
+        // Task A – cache manifests + leading segments for first 3 videos.
+        VideoPreloadManager.instance
+            .preloadInitialBatch(urls, count: 3)
+            .timeout(
+          const Duration(seconds: 4), // hard cap — matches splash duration
+          onTimeout: () {
+            timedOut = true;
+            LoggerService.w('[Splash] ⏱ Segment preload timed out after 4 s');
+          },
+        ),
+
+        // Task B – warm up controllers for videos 0 AND 1 in parallel.
+        Future(() async {
+          try {
+            LoggerService.d('[Splash] 🔥 Warming up controllers for videos 0 & 1…');
+            final ctrlStart = DateTime.now();
+            final warmUrls = urls.take(2).toList();
+            await Future.wait(
+              warmUrls.map((u) => VideoControllerPool.instance.getControllerFor(u)),
+            );
+            LoggerService.i(
+              '[Splash] ✅ Controllers (${warmUrls.length}) ready '
+              '(${DateTime.now().difference(ctrlStart).inMilliseconds} ms)',
+            );
+          } catch (e) {
+            LoggerService.w('[Splash] ⚠️ Controller warm-up failed: $e');
+          }
+        }),
+      ]);
+
+      if (!timedOut) {
+        LoggerService.i(
+          '[Splash] ✅ Parallel phase complete '
+          '(${DateTime.now().difference(parallelStart).inMilliseconds} ms)',
+        );
+      }
+    } catch (e) {
+      LoggerService.e('[Splash] ❌ Bootstrap error: $e');
+    }
+
+    LoggerService.i(
+      '[Splash] 🏁 Bootstrap done '
+      '(${DateTime.now().difference(bootstrapStart).inMilliseconds} ms)',
     );
   }
 

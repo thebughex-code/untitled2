@@ -61,13 +61,21 @@ class SegmentCache {
     final now = DateTime.now();
     final expiryLimit = now.subtract(const Duration(days: 7));
     int deletedCount = 0;
+    int tmpDeleted = 0;
 
     await for (final entity in dir.list()) {
       if (entity is File) {
         try {
+          // 1. Delete stale .tmp files left over from a previous crash/kill
+          if (entity.path.endsWith('.tmp')) {
+            await entity.delete();
+            tmpDeleted++;
+            continue;
+          }
+
           final stat = await entity.stat();
-          
-          // 1. Check Expiry
+
+          // 2. Check Expiry (7 days)
           if (stat.modified.isBefore(expiryLimit)) {
             await entity.delete();
             deletedCount++;
@@ -79,6 +87,10 @@ class SegmentCache {
           LoggerService.w('[SegmentCache] Failed to stat/delete file: ${entity.path}');
         }
       }
+    }
+
+    if (tmpDeleted > 0) {
+      LoggerService.i('[SegmentCache] Cleaned up $tmpDeleted stale .tmp files from previous session.');
     }
 
     if (deletedCount > 0) {
@@ -196,7 +208,6 @@ class SegmentCache {
   Future<void> _addToDiskCache(String key, Uint8List data) async {
     final path = '$_cacheDir/$key';
     final tmpPath = '$path.tmp';
-    final file = File(path);
     final tmpFile = File(tmpPath);
 
     try {

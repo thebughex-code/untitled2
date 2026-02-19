@@ -1,5 +1,4 @@
 import 'dart:collection';
-import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../core/hls/hls_cache_manager.dart';
@@ -20,9 +19,13 @@ class VideoControllerPool {
   // ---------------------------------------------------------------------------
   
   /// Maximum number of controllers to keep in memory.
-  /// Reduced to 2 to strictly limit heavy hardware decoder usage on Android.
-  /// This prevents "tucking"/freezing when scrolling.
-  int maxSize = 2;
+  /// 3 = current + 1 forward + 1 backward.
+  /// This prevents the "loader on back-scroll" bug while staying within
+  /// Android decoder limits (3 simultaneous decoders is safe on all devices ≥2020).
+  /// Maximum number of controllers to keep in memory.
+  /// 5 = current + 2 forward + 2 backward — covers the full ±2 init window
+  /// used by VideoPlayerWidget, so back-scroll never shows a loader.
+  int maxSize = 5;
 
   // ---------------------------------------------------------------------------
   // State
@@ -39,13 +42,30 @@ class VideoControllerPool {
   /// The currently active video URL (to prevent evicting the playing video).
   String? _currentUrl;
 
+  /// The previously active video URL – protected to enable instant back-scroll.
+  String? _prevUrl;
+
+  /// The next video URL – protected so the pre-warmed controller isn't evicted
+  /// before the user swipes to it.
+  String? _nextUrl;
+
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------
 
   /// Sets the currently active video. This video will NOT be evicted.
+  /// The previous URL is kept for one transition to enable instant back-scroll.
   void setCurrentUrl(String url) {
+    if (_currentUrl != url) {
+      _prevUrl = _currentUrl; // protect the video we just came from
+    }
     _currentUrl = url;
+  }
+
+  /// Sets the upcoming (next) video URL so it is protected from LRU eviction
+  /// while the pre-warmed controller waits for the swipe.
+  void setNextUrl(String? url) {
+    _nextUrl = url;
   }
 
   /// Returns an existing controller for [url] or creates a new one.
@@ -112,7 +132,7 @@ class VideoControllerPool {
       final controller = VideoPlayerController.networkUrl(
         Uri.parse(proxyUrl),
         httpHeaders: const {'Connection': 'keep-alive'},
-        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: false),
+        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: true),
       );
       
       await controller.initialize();
@@ -126,7 +146,7 @@ class VideoControllerPool {
       try {
         final controller = VideoPlayerController.networkUrl(
           Uri.parse(url), // Original URL
-          videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: false),
+          videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: true),
         );
         await controller.initialize();
         controller.setLooping(true);
@@ -143,6 +163,47 @@ class VideoControllerPool {
       if (savedPos != null) {
          controller.seekTo(savedPos);
       }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle helpers (called by VideoFeedScreen's WidgetsBindingObserver)
+  // ---------------------------------------------------------------------------
+
+  /// Save positions of ALL live controllers.
+  /// Called when the app is about to be backgrounded so that if the OS
+  /// kills a controller, we can restore from the saved position on resume.
+  void saveAllPositions() {
+    for (final entry in _controllers.entries) {
+      _savePosition(entry.key, entry.value);
+    }
+    LoggerService.d(
+      '[VideoPool] 💾 Saved positions for ${_controllers.length} controller(s)',
+    );
+  }
+
+  /// Pause the currently active controller (called on app background).
+  void pauseCurrentVideo() {
+    final url = _currentUrl;
+    if (url == null) return;
+    final ctrl = _controllers[url];
+    if (ctrl != null && ctrl.value.isInitialized) {
+      ctrl.pause();
+      LoggerService.d('[VideoPool] ⏸ Paused controller for $url');
+    }
+  }
+
+  /// Resume the currently active controller (called on app foreground).
+  /// Only calls play() — never re-creates the controller.
+  void resumeCurrentVideo() {
+    final url = _currentUrl;
+    if (url == null) return;
+    final ctrl = _controllers[url];
+    if (ctrl != null && ctrl.value.isInitialized) {
+      ctrl.play();
+      LoggerService.i('[VideoPool] ▶️ Resuming controller for $url');
+    } else {
+      LoggerService.w('[VideoPool] ⚠️ Resume requested but no live controller for $url');
+    }
   }
 
   /// Stop and dispose a specific controller (e.g., on error).
@@ -172,11 +233,10 @@ class VideoControllerPool {
 
   void _enforceMaxSize() {
     while (_controllers.length > maxSize) {
-      // Evict the least recently used (first key),
-      // BUT skip the current URL if it happens to be the LRU (unlikely with map logic, but safe).
+      // Evict LRU, but protect _currentUrl and _prevUrl.
       String? evictKey;
-      for (var key in _controllers.keys) {
-        if (key != _currentUrl) {
+      for (final key in _controllers.keys) {
+        if (key != _currentUrl && key != _prevUrl && key != _nextUrl) {
           evictKey = key;
           break;
         }
@@ -190,8 +250,7 @@ class VideoControllerPool {
           LoggerService.d('[VideoPool] Evicted $evictKey. Pool size: ${_controllers.length}');
         }
       } else {
-        // If we only have the current URL (and size > max?), break.
-        // Should not happen if maxSize >= 1.
+        // All remaining controllers are protected — can't evict.
         break;
       }
     }
