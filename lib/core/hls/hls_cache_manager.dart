@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 
-import 'preload_manager.dart';
+
 import 'video_preload_manager.dart';
 import 'proxy_server.dart';
 import 'segment_cache.dart';
@@ -22,7 +22,7 @@ class HlsCacheManager {
   // ---------------------------------------------------------------------------
   late final SegmentCache cache;
   late final ProxyServer proxyServer;
-  late final PreloadManager preloadManager;
+  // late final PreloadManager preloadManager; // Deprecated in favor of VideoPreloadManager
 
   bool _initialized = false;
   bool get isInitialized => _initialized;
@@ -44,12 +44,6 @@ class HlsCacheManager {
     
     // Relative URLs in ManifestParser now handle port changes, so we persist cache.
     // await cache.clear(); 
-
-    preloadManager = PreloadManager(
-      proxyServer: proxyServer,
-      preloadSegmentCount: 1,
-      slidingWindowSize: 2,
-    );
 
     // Initialize the advanced VideoPreloadManager
     VideoPreloadManager.instance.setProxy(proxyServer);

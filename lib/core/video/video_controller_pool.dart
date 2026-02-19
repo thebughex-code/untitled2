@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../core/hls/hls_cache_manager.dart';
+import '../services/logger_service.dart';
 
 /// Manages a pool of [VideoPlayerController]s to limit memory usage and
 /// provide instant playback for recent videos.
@@ -19,8 +20,9 @@ class VideoControllerPool {
   // ---------------------------------------------------------------------------
   
   /// Maximum number of controllers to keep in memory.
-  /// Reduced to 3 to prevent iOS Metal/Texture limit issues.
-  int maxSize = 3;
+  /// Reduced to 2 to strictly limit heavy hardware decoder usage on Android.
+  /// This prevents "tucking"/freezing when scrolling.
+  int maxSize = 2;
 
   // ---------------------------------------------------------------------------
   // State
@@ -89,28 +91,58 @@ class VideoControllerPool {
     }
   }
 
-  Future<VideoPlayerController> _createController(String url) async {
-    final proxyUrl = HlsCacheManager.instance.getProxiedUrl(url);
-    final controller = VideoPlayerController.networkUrl(
-      Uri.parse(proxyUrl),
-      httpHeaders: const {'Connection': 'keep-alive'},
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: false),
-    );
+  /// Synchronous check: returns controller if already in pool and ready.
+  /// Used to avoid async gap (1-frame loader) in the UI.
+  VideoPlayerController? getControllerNow(String url) {
+    if (_controllers.containsKey(url)) {
+      // Move to MRU
+      final controller = _controllers.remove(url)!;
+      _controllers[url] = controller;
+      return controller;
+    }
+    return null;
+  }
 
+  Future<VideoPlayerController> _createController(String url) async {
+    // 1. Try Proxy URL (Caching)
     try {
+      final proxyUrl = HlsCacheManager.instance.getProxiedUrl(url);
+      LoggerService.d('[VideoPool] 🟢 Initializing via Proxy: $proxyUrl');
+
+      final controller = VideoPlayerController.networkUrl(
+        Uri.parse(proxyUrl),
+        httpHeaders: const {'Connection': 'keep-alive'},
+        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: false),
+      );
+      
       await controller.initialize();
       controller.setLooping(true);
-
-      // Restore position if available
-      final savedPos = _savedPositions[url];
-      if (savedPos != null) {
-         await controller.seekTo(savedPos);
-      }
+      _restorePosition(url, controller);
       return controller;
     } catch (e) {
-      controller.dispose();
-      throw Exception('Failed to init controller for $url: $e');
+      LoggerService.w('[VideoPool] Proxy init failed for $url: $e. Falling back to NETWORK.');
+      
+      // 2. Fallback to Network URL (Direct)
+      try {
+        final controller = VideoPlayerController.networkUrl(
+          Uri.parse(url), // Original URL
+          videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true, allowBackgroundPlayback: false),
+        );
+        await controller.initialize();
+        controller.setLooping(true);
+        _restorePosition(url, controller);
+        return controller;
+      } catch (e2) {
+         throw Exception('Failed to init controller (both proxy and network) for $url: $e2');
+      }
     }
+  }
+
+  void _restorePosition(String url, VideoPlayerController controller) {
+      final savedPos = _savedPositions[url];
+      if (savedPos != null) {
+         controller.seekTo(savedPos);
+      }
   }
 
   /// Stop and dispose a specific controller (e.g., on error).
@@ -155,7 +187,7 @@ class VideoControllerPool {
         if (controller != null) {
           _savePosition(evictKey, controller);
           controller.dispose();
-          debugPrint('[VideoPool] Evicted $evictKey. Pool size: ${_controllers.length}');
+          LoggerService.d('[VideoPool] Evicted $evictKey. Pool size: ${_controllers.length}');
         }
       } else {
         // If we only have the current URL (and size > max?), break.

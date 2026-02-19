@@ -119,9 +119,9 @@ class ProxyServer {
     // 2. Download original manifest
     final data = await _downloadWithTimeout(url);
     if (data == null) {
-      LoggerService.w('[ProxyServer] Failed to fetch manifest: $url. Returning 503.');
-      request.response.statusCode = HttpStatus.serviceUnavailable;
-      await request.response.close();
+      LoggerService.w('[ProxyServer] Failed to fetch manifest: $url. Redirecting to upstream.');
+      // FALLBACK: Redirect to original URL so player can try directly
+      request.response.redirect(Uri.parse(url), status: HttpStatus.movedTemporarily);
       return;
     }
 
@@ -159,9 +159,9 @@ class ProxyServer {
   Future<void> _handleSegment(HttpRequest request, String url) async {
     final data = await getOrDownloadSegment(url);
     if (data == null) {
-      LoggerService.w('[ProxyServer] Failed to fetch segment: $url. Returning 503.');
-      request.response.statusCode = HttpStatus.serviceUnavailable;
-      await request.response.close();
+      LoggerService.w('[ProxyServer] Failed to fetch segment: $url. Redirecting to upstream.');
+      // FALLBACK: Redirect to original URL
+      request.response.redirect(Uri.parse(url), status: HttpStatus.movedTemporarily);
       return;
     }
 
@@ -320,39 +320,61 @@ class ProxyServer {
   Future<Uint8List?> _downloadWithTimeout(
     String url, {
     Duration timeout = const Duration(seconds: 15),
+    int retries = 3,
   }) async {
-    final start = DateTime.now();
-    try {
-      LoggerService.d('[ProxyServer] Downloading: $url');
-      final response =
-          await _httpClient.get(
-            Uri.parse(url),
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            },
-          ).timeout(timeout);
-      
-      final elapsed = DateTime.now().difference(start).inMilliseconds;
-      
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        LoggerService.d('[ProxyServer] Downloaded ${response.bodyBytes.length} bytes in ${elapsed}ms: $url');
-        return response.bodyBytes;
+    int attempt = 0;
+    while (attempt < retries) {
+      if (attempt > 0) {
+        // Exponential backoff: 500ms, 1000ms, 2000ms
+        final backoff = Duration(milliseconds: 500 * (1 << (attempt - 1)));
+        LoggerService.w('[ProxyServer] Retrying ($attempt/$retries) for $url after ${backoff.inMilliseconds}ms');
+        await Future.delayed(backoff);
       }
-      LoggerService.e(
-          '[ProxyServer] HTTP ${response.statusCode} in ${elapsed}ms for $url');
-      return null;
-    } on TimeoutException {
-      LoggerService.e('[ProxyServer] Timeout downloading $url');
-      return null;
-    } on SocketException catch (e) {
-      LoggerService.w('[ProxyServer] 🚫 OFFLINE / Network unreachable for $url. Error: $e');
-      return null;
-    } on HandshakeException catch (e) {
-      LoggerService.e('[ProxyServer] 🔒 SSL Handshake failed for $url. Error: $e');
-      return null;
-    } catch (e) {
-      LoggerService.e('[ProxyServer] Download error for $url: $e');
-      return null;
+      attempt++;
+
+      final start = DateTime.now();
+      try {
+        LoggerService.d('[ProxyServer] Download Attempt $attempt: $url');
+        final response = await _httpClient.get(
+          Uri.parse(url),
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          },
+        ).timeout(timeout);
+
+        final elapsed = DateTime.now().difference(start).inMilliseconds;
+
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          LoggerService.d('[ProxyServer] Downloaded ${response.bodyBytes.length} bytes in ${elapsed}ms: $url');
+          return response.bodyBytes;
+        }
+
+        // 503 Service Unavailable -> Retryable
+        if (response.statusCode == 503 || response.statusCode == 429) {
+          LoggerService.w('[ProxyServer] HTTP ${response.statusCode} (Retryable) for $url');
+          continue; // Trigger retry
+        }
+
+        LoggerService.e('[ProxyServer] HTTP ${response.statusCode} in ${elapsed}ms for $url');
+        // Non-retryable error (404, 403, 500 etc)
+        // For now, we return null, which triggers the Redirect fallback
+        return null; 
+
+      } on TimeoutException {
+        LoggerService.e('[ProxyServer] Timeout downloading $url');
+        // Retry on timeout? Maybe.
+        continue;
+      } on SocketException catch (e) {
+        LoggerService.w('[ProxyServer] 🚫 OFFLINE / Network unreachable for $url. Error: $e');
+        return null; // Don't retry if offline
+      } on HandshakeException catch (e) {
+        LoggerService.e('[ProxyServer] 🔒 SSL Handshake failed for $url. Error: $e');
+        return null;
+      } catch (e) {
+        LoggerService.e('[ProxyServer] Download error for $url: $e');
+        return null;
+      }
     }
+    return null; // All retries failed
   }
 }

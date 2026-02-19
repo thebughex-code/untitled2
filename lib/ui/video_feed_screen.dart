@@ -56,6 +56,7 @@ class _VideoFeedScreenState extends State<VideoFeedScreen> {
       body: PageView.builder(
         controller: _pageController,
         scrollDirection: Axis.vertical,
+        allowImplicitScrolling: true, // Crucial for pre-building next page
         onPageChanged: _onPageChanged,
         itemCount: _videos.length,
         itemBuilder: (context, index) {

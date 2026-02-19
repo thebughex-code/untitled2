@@ -72,6 +72,28 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
         return;
     }
 
+    // OPTIMIZATION: Try to get controller SYNCHRONOUSLY to avoid 1-frame loader
+    // This pairs with the Splash Screen pre-warming.
+    final existing = VideoControllerPool.instance.getControllerNow(widget.videoUrl);
+    if (existing != null) {
+        debugPrint('[VideoPlayer] ⚡️ Instant synchronous init for ${widget.index}');
+        _controller = existing;
+        _initialized = true;
+        
+        // Attach listeners immediately
+        _controller!.addListener(_onControllerUpdate);
+        
+        // Prevent eviction
+        if (widget.index == widget.currentIndex) {
+             VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+        }
+
+        if (widget.shouldPlay) {
+             _safePlay(); // Fire and forget (it's already ready)
+        }
+        return; 
+    }
+
     _initPlayer();
   }
 
@@ -113,6 +135,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       _controller!.addListener(_onControllerUpdate);
 
       if (widget.shouldPlay) {
+        debugPrint('[VideoPlayer] 🎬 Starting playback for ${widget.index}');
         await _safePlay();
       }
     } catch (e) {
@@ -124,6 +147,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       if (!mounted) return;
       final isBuffering = _controller?.value.isBuffering ?? false;
       if (isBuffering != _isBuffering) {
+          debugPrint('[VideoPlayer] ⏳ Buffering changed for ${widget.index}: $isBuffering');
           setState(() => _isBuffering = isBuffering);
       }
   }

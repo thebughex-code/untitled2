@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
 import '../core/hls/hls_cache_manager.dart';
+import '../core/hls/video_preload_manager.dart';
 import '../core/models/video_data.dart';
+import '../core/video/video_controller_pool.dart';
 import 'video_feed_screen.dart';
 
 /// Branded splash screen shown while the HLS cache system boots up and the
@@ -36,15 +38,22 @@ class _SplashScreenState extends State<SplashScreen>
 
       // 2. Pre-load the first 4 videos (manifest + first 5 sec segments)
       final urls = VideoData.videos.map((v) => v.url).toList();
-      await HlsCacheManager.instance.preloadManager
+      await VideoPreloadManager.instance
           .preloadInitialBatch(urls, count: 4)
           .timeout(
             const Duration(seconds: 10),
             onTimeout: () {
-              // Don't block forever – the proxy will fetch on demand.
               debugPrint('[Splash] preload timed out, continuing…');
             },
           );
+
+      // 3. WARM UP THE CONTROLLER (The Critical Fix)
+      // Initialize the player for the very first video RIGHT NOW.
+      // This absorbs the "loader" time into the splash screen.
+      if (urls.isNotEmpty) {
+        debugPrint('[Splash] 🚀 Warming up first controller: ${urls.first}');
+        await VideoControllerPool.instance.getControllerFor(urls.first);
+      }
     } catch (e) {
       debugPrint('[Splash] bootstrap error: $e');
     }

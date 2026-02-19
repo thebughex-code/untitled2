@@ -73,10 +73,10 @@ class PreloadManager {
   /// are ready before the feed is shown.
   Future<void> preloadInitialBatch(List<String> urls, {int count = 3}) async {
     final batch = urls.take(count).toList();
-    await Future.wait(
-      batch.map((url) => preloadVideo(url)),
-      eagerError: false,
-    );
+    // Sequential preload to avoid hitting upstream rate limits (503s)
+    for (final url in batch) {
+      await preloadVideo(url);
+    }
   }
 
   /// Called when the visible page changes.  Pre-loads videos in the sliding

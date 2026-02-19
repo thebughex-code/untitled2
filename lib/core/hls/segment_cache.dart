@@ -18,7 +18,7 @@ class SegmentCache {
   // ---------------------------------------------------------------------------
   // Configuration
   // ---------------------------------------------------------------------------
-  static const int maxDiskCacheBytes = 500 * 1024 * 1024; // 500 MB
+  static const int maxDiskCacheBytes = 100 * 1024 * 1024; // 100 MB (Lightweight)
   static const int maxMemoryEntries = 50;
 
   // ---------------------------------------------------------------------------
