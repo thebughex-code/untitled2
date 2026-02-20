@@ -1,13 +1,17 @@
+import 'dart:async';
 import 'dart:collection';
+
+import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 
 import '../../core/hls/hls_cache_manager.dart';
 import '../services/logger_service.dart';
+import '../../main.dart'; // To access the global proxy
 
-/// Manages a pool of [VideoPlayerController]s to limit memory usage and
-/// provide instant playback for recent videos.
+/// Manages a pool of VideoPlayerControllers to optimize resources and memory.
 ///
-/// - **LRU Eviction**: Keeps a maximum of [maxSize] controllers.
+/// Ensures we never have more than [maxSize] concurrent native video decoders
+/// active, which prevents Android `pipelineFull` crashes on heavy-scroll apps.
 /// - **State Preservation**: Saves playback position when a controller is evicted,
 ///   so it can be restored if the user scrolls back.
 class VideoControllerPool {
@@ -23,9 +27,13 @@ class VideoControllerPool {
   /// This prevents the "loader on back-scroll" bug while staying within
   /// Android decoder limits (3 simultaneous decoders is safe on all devices ≥2020).
   /// Maximum number of controllers to keep in memory.
-  /// 5 = current + 2 forward + 2 backward — covers the full ±2 init window
-  /// used by VideoPlayerWidget, so back-scroll never shows a loader.
-  int maxSize = 5;
+  /// 3 = current + 1 forward + 1 backward.
+  /// This prevents decoder limits (pipelineFull) while keeping minimum smooth scrolling.
+  int maxSize = 3;
+
+  /// Global volume state. 0.0 means muted, 1.0 means full volume.
+  /// Videos should listen to this notifier to sync mute state instantly.
+  final ValueNotifier<double> globalVolume = ValueNotifier<double>(1.0);
 
   // ---------------------------------------------------------------------------
   // State
@@ -137,6 +145,7 @@ class VideoControllerPool {
       
       await controller.initialize();
       controller.setLooping(true);
+      controller.setVolume(globalVolume.value);
       _restorePosition(url, controller);
       return controller;
     } catch (e) {
@@ -150,6 +159,7 @@ class VideoControllerPool {
         );
         await controller.initialize();
         controller.setLooping(true);
+        controller.setVolume(globalVolume.value);
         _restorePosition(url, controller);
         return controller;
       } catch (e2) {

@@ -175,11 +175,16 @@ class VideoPreloadManager {
     };
 
     // 3. Cancel stale in-flight downloads outside the protected set
+    final toCancel = <String>[];
     for (final url in _processing) {
       if (!protectedUrls.contains(url) && !_completed.contains(url)) {
         _cancelSet.add(url);
-        LoggerService.d('[PreloadManager] 🛑 Cancelling stale fetch: $url');
+        toCancel.add(url);
+        LoggerService.d('[PreloadManager] 🛑 Cancelling stale fetch: ...${url.substring(url.length - 20 > 0 ? url.length - 20 : 0)}');
       }
+    }
+    if (toCancel.isNotEmpty) {
+      _proxyServer?.cancelPendingDownloads(toCancel);
     }
 
     // 4. Clear pending queue and rebuild with the new window

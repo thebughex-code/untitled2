@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'package:logger/logger.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 
 /// Simple printer for iOS that outputs plain text without ANSI codes.
 /// Xcode console doesn't support ANSI escape sequences.
@@ -117,6 +119,18 @@ class LoggerService {
 
   static void e(dynamic message, {Object? error, StackTrace? stackTrace}) {
     if (kDebugMode) _logger.e(message, error: error, stackTrace: stackTrace);
+    
+    // Log to Crashlytics
+    try {
+      if (Firebase.apps.isNotEmpty) {
+        FirebaseCrashlytics.instance.recordError(
+          error ?? Exception(message.toString()), 
+          stackTrace, 
+          reason: message.toString(), 
+          fatal: false
+        );
+      }
+    } catch (_) {}
   }
 
   static void v(dynamic message, {Object? error, StackTrace? stackTrace}) {
@@ -125,5 +139,17 @@ class LoggerService {
 
   static void wtf(dynamic message, {Object? error, StackTrace? stackTrace}) {
     if (kDebugMode) _logger.f(message, error: error, stackTrace: stackTrace); // wtf -> fatal
+
+    // Log fatal to Crashlytics
+    try {
+      if (Firebase.apps.isNotEmpty) {
+        FirebaseCrashlytics.instance.recordError(
+          error ?? Exception(message.toString()), 
+          stackTrace, 
+          reason: message.toString(), 
+          fatal: true
+        );
+      }
+    } catch (_) {}
   }
 }

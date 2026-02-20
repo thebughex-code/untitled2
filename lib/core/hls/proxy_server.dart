@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
+import 'package:dio/dio.dart';
 
 import 'manifest_parser.dart';
 import 'segment_cache.dart';
@@ -16,27 +16,37 @@ import '../services/logger_service.dart';
 ///  2. Serves cached segments or downloads them on-demand.
 ///  3. Handles HTTP Range requests (needed by Android ExoPlayer).
 ///  4. De-duplicates concurrent downloads for the same resource.
+///  5. Supports cancellation of pending downloads via Dio CancelTokens.
 class ProxyServer {
   // ---------------------------------------------------------------------------
   // Dependencies
   // ---------------------------------------------------------------------------
   final SegmentCache cache;
 
-  /// Pool of 4 HTTP clients for parallel requests without head-of-line blocking.
-  /// Each client maintains its own connection pool to the CDN.
+  /// Pool of 4 Dio clients for parallel requests without head-of-line blocking.
   static const int _clientPoolSize = 4;
-  final List<http.Client> _clientPool =
-      List.generate(_clientPoolSize, (_) => http.Client());
+  final List<Dio> _clientPool;
   int _clientIndex = 0;
 
   /// Returns the next client from the round-robin pool.
-  http.Client get _nextClient {
+  Dio get _nextClient {
     final client = _clientPool[_clientIndex % _clientPoolSize];
     _clientIndex++;
     return client;
   }
 
-  ProxyServer({required this.cache});
+  ProxyServer({required this.cache}) : _clientPool = List.generate(
+      _clientPoolSize, 
+      (_) => Dio(BaseOptions(
+        connectTimeout: const Duration(seconds: 5),
+        receiveTimeout: const Duration(seconds: 15),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; HLSProxy/1.0)',
+          'Accept': '*/*',
+          'Connection': 'keep-alive',
+        },
+      ))
+  );
 
   // ---------------------------------------------------------------------------
   // State
@@ -46,10 +56,11 @@ class ProxyServer {
 
   /// Track in-flight downloads → prevents redundant fetches.
   final Map<String, Completer<Uint8List>> _inFlightDownloads = {};
+  
+  /// Track cancel tokens to allow aborting requests if the user swipes away quickly.
+  final Map<String, CancelToken> _cancelTokens = {};
 
   /// In-memory cache for rewritten manifests.
-  /// HLS players request manifests frequently (every few seconds for live/sliding windows).
-  /// Serving from memory eliminates disk I/O latency and ensures zero-delay playback starts.
   final Map<String, Uint8List> _manifestCache = {};
 
   /// In-memory cache for segment URL lists (used by PreloadManager).
@@ -72,8 +83,23 @@ class ProxyServer {
 
   Future<void> stop() async {
     await _server?.close(force: true);
+    for (final token in _cancelTokens.values) {
+      if (!token.isCancelled) token.cancel('ProxyServer shutting down');
+    }
+    _cancelTokens.clear();
     for (final client in _clientPool) {
-      client.close();
+      client.close(force: true);
+    }
+  }
+  
+  /// Call this when a video is swiped away to halt its pending downloads
+  void cancelPendingDownloads(List<String> urls) {
+    for (final url in urls) {
+      final token = _cancelTokens.remove(url);
+      if (token != null && !token.isCancelled) {
+        token.cancel('Swiped away');
+        LoggerService.d('[ProxyServer] 🛑 Cancelled download: ...${url.substring(url.length - 20 > 0 ? url.length - 20 : 0)}');
+      }
     }
   }
 
@@ -106,6 +132,14 @@ class ProxyServer {
       await request.response.close();
       return;
     }
+
+    // IMPORTANT: If the client (VideoPlayer) disconnects early, we should cancel
+    // the downstream fetching to save total bandwidth.
+    // We attach a listener to the client connection.
+    final clientSubscription = request.response.done.catchError((_) {}).then((_) {
+       // If the proxy finished properly, this is a no-op.
+       // If the player closed the connection early, this gives us a hook.
+    });
 
     try {
       final path = request.uri.path;
@@ -176,11 +210,14 @@ class ProxyServer {
   }
 
   void _writeManifestResponse(HttpRequest request, Uint8List data) {
-    request.response.headers
-        .set('Content-Type', 'application/vnd.apple.mpegurl');
-    request.response.headers.contentLength = data.length;
-    request.response.add(data);
-    request.response.close();
+    try {
+       request.response.headers.set('Content-Type', 'application/vnd.apple.mpegurl');
+       request.response.headers.contentLength = data.length;
+       request.response.add(data);
+       request.response.close();
+    } catch (_) {
+       // Ignore broken pipe
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -192,41 +229,45 @@ class ProxyServer {
     if (data == null) {
       LoggerService.w('[ProxyServer] Failed to fetch segment: $url. Redirecting to upstream.');
       // FALLBACK: Redirect to original URL
-      request.response.redirect(Uri.parse(url), status: HttpStatus.movedTemporarily);
+      try { request.response.redirect(Uri.parse(url), status: HttpStatus.movedTemporarily); } catch (_) {}
       return;
     }
 
-    // Content type
-    final contentType = _segmentContentType(url);
-    request.response.headers.set('Content-Type', contentType);
-    request.response.headers.set('Accept-Ranges', 'bytes');
-
-    // Range request?
-    final rangeHeader = request.headers.value('range');
-    if (rangeHeader != null) {
-      final match = RegExp(r'bytes=(\d+)-(\d*)').firstMatch(rangeHeader);
-      if (match != null) {
-        final start = int.parse(match.group(1)!);
-        final end = match.group(2)!.isEmpty
-            ? data.length - 1
-            : int.parse(match.group(2)!);
-        final clampedEnd = end.clamp(start, data.length - 1);
-        final length = clampedEnd - start + 1;
-
-        request.response.statusCode = 206;
-        request.response.headers
-            .set('Content-Range', 'bytes $start-$clampedEnd/${data.length}');
-        request.response.headers.contentLength = length;
-        request.response.add(data.sublist(start, clampedEnd + 1));
-        await request.response.close();
-        return;
+    try {
+      // Content type
+      final contentType = _segmentContentType(url);
+      request.response.headers.set('Content-Type', contentType);
+      request.response.headers.set('Accept-Ranges', 'bytes');
+  
+      // Range request?
+      final rangeHeader = request.headers.value('range');
+      if (rangeHeader != null) {
+        final match = RegExp(r'bytes=(\d+)-(\d*)').firstMatch(rangeHeader);
+        if (match != null) {
+          final start = int.parse(match.group(1)!);
+          final end = match.group(2)!.isEmpty
+              ? data.length - 1
+              : int.parse(match.group(2)!);
+          final clampedEnd = end.clamp(start, data.length - 1);
+          final length = clampedEnd - start + 1;
+  
+          request.response.statusCode = 206;
+          request.response.headers
+              .set('Content-Range', 'bytes $start-$clampedEnd/${data.length}');
+          request.response.headers.contentLength = length;
+          request.response.add(data.sublist(start, clampedEnd + 1));
+          await request.response.close();
+          return;
+        }
       }
+  
+      // Full response
+      request.response.headers.contentLength = data.length;
+      request.response.add(data);
+      await request.response.close();
+    } catch (_) {
+      // Ignore broken pipes from closed players
     }
-
-    // Full response
-    request.response.headers.contentLength = data.length;
-    request.response.add(data);
-    await request.response.close();
   }
 
   String _segmentContentType(String url) {
@@ -277,7 +318,7 @@ class ProxyServer {
         return data;
       }
       if (!completer.isCompleted) {
-        completer.completeError(Exception('Download failed for $url'));
+        completer.completeError(Exception('Download failed or cancelled for $url'));
       }
       return null;
     } catch (e) {
@@ -285,6 +326,7 @@ class ProxyServer {
       return null;
     } finally {
       _inFlightDownloads.remove(url);
+      _cancelTokens.remove(url);
     }
   }
 
@@ -361,41 +403,50 @@ class ProxyServer {
   // HTTP helper
   // ---------------------------------------------------------------------------
 
-  /// Downloads [url] with timeout, retry, and exponential backoff.
+  /// Downloads [url] with timeout, retry, and exponential backoff using Dio.
   /// Uses a fresh client from the pool so large downloads don't block other requests.
   Future<Uint8List?> _downloadWithTimeout(
     String url, {
-    Duration timeout = const Duration(seconds: 8),
     int retries = 2,
   }) async {
-    // Use round-robin pool client for this request
+    // Generate cancel token to allow aborting this specific download
+    final cancelToken = CancelToken();
+    _cancelTokens[url] = cancelToken;
+    
     final client = _nextClient;
     int attempt = 0;
+    
     while (attempt < retries) {
+      if (cancelToken.isCancelled) {
+          LoggerService.d('[ProxyServer] Download aborted early via CancelToken: $url');
+          return null;
+      }
+      
       if (attempt > 0) {
         final backoff = Duration(milliseconds: 300 * (1 << (attempt - 1)));
         LoggerService.w('[ProxyServer] Retrying ($attempt/$retries) for $url after ${backoff.inMilliseconds}ms');
-        await Future.delayed(backoff);
+        try {
+          await Future.delayed(backoff);
+        } catch (_) {}
       }
       attempt++;
 
       final start = DateTime.now();
       try {
-        LoggerService.d('[ProxyServer] Download Attempt $attempt: $url');
-        final response = await client.get(
-          Uri.parse(url),
-          headers: const {
-            'User-Agent': 'Mozilla/5.0 (compatible; HLSProxy/1.0)',
-            'Accept': '*/*',
-            'Connection': 'keep-alive',
-          },
-        ).timeout(timeout);
+        LoggerService.d('[ProxyServer] Download Attempt $attempt: ...${url.substring(url.length - 15 > 0 ? url.length - 15 : 0)}');
+        
+        final response = await client.get<List<int>>(
+          url,
+          cancelToken: cancelToken,
+          options: Options(responseType: ResponseType.bytes),
+        );
 
         final elapsed = DateTime.now().difference(start).inMilliseconds;
 
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          LoggerService.d('[ProxyServer] Downloaded ${response.bodyBytes.length} bytes in ${elapsed}ms: $url');
-          return response.bodyBytes;
+        if (response.statusCode != null && response.statusCode! >= 200 && response.statusCode! < 300) {
+          final bytes = Uint8List.fromList(response.data!);
+          LoggerService.d('[ProxyServer] Downloaded ${bytes.length} bytes in ${elapsed}ms: ...${url.substring(url.length - 15 > 0 ? url.length - 15 : 0)}');
+          return bytes;
         }
 
         // 503 Service Unavailable -> Retryable
@@ -405,20 +456,29 @@ class ProxyServer {
         }
 
         LoggerService.e('[ProxyServer] HTTP ${response.statusCode} in ${elapsed}ms for $url');
-        // Non-retryable error (404, 403, 500 etc)
-        // For now, we return null, which triggers the Redirect fallback
         return null; 
 
-      } on TimeoutException {
-        LoggerService.e('[ProxyServer] Timeout downloading $url');
-        // Retry on timeout? Maybe.
-        continue;
-      } on SocketException catch (e) {
-        LoggerService.w('[ProxyServer] 🚫 OFFLINE / Network unreachable for $url. Error: $e');
-        return null; // Don't retry if offline
-      } on HandshakeException catch (e) {
-        LoggerService.e('[ProxyServer] 🔒 SSL Handshake failed for $url. Error: $e');
-        return null;
+      } on DioException catch (e) {
+        if (CancelToken.isCancel(e)) {
+           LoggerService.d('[ProxyServer] Download CANCELLED by user: ...${url.substring(url.length - 15 > 0 ? url.length - 15 : 0)}');
+           return null;
+        }
+        
+        if (e.type == DioExceptionType.connectionTimeout || e.type == DioExceptionType.receiveTimeout) {
+           LoggerService.e('[ProxyServer] Timeout downloading $url');
+           continue; // Retry
+        }
+        
+        if (e.type == DioExceptionType.connectionError) {
+           LoggerService.w('[ProxyServer] 🚫 OFFLINE / Network unreachable for $url. Error: ${e.message}');
+           return null; // Don't retry if offline
+        }
+        
+        LoggerService.e('[ProxyServer] DioError for $url: ${e.message}');
+        // Might be a 404/403
+        if (e.response?.statusCode != 503 && e.response?.statusCode != 429) {
+            return null; 
+        }
       } catch (e) {
         LoggerService.e('[ProxyServer] Download error for $url: $e');
         return null;

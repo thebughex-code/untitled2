@@ -102,14 +102,14 @@ class _VideoFeedScreenState extends State<VideoFeedScreen>
       windowSize: windowSize,
     );
 
-    // 5. 🔥 Proactively pre-warm controllers for next 2 videos (fire-and-forget).
-    for (int i = 1; i <= 2; i++) {
-      final nextIdx = index + i;
-      if (nextIdx < _videos.length) {
-        VideoControllerPool.instance
-            .getControllerFor(_videos[nextIdx].url)
-            .ignore();
-      }
+    // 5. 🔥 Proactively pre-warm controllers for next 1 video (saving decoders).
+    for (int i = 1; i <= 1; i++) {
+        final nextIdx = index + i;
+        if (nextIdx < _videos.length) {
+            VideoControllerPool.instance
+                .getControllerFor(_videos[nextIdx].url)
+                .ignore();
+        }
     }
 
     debugPrint('[Feed] 📄 Page $index — window=$windowSize (${msSinceLast}ms since last swipe)');
@@ -133,10 +133,44 @@ class _VideoFeedScreenState extends State<VideoFeedScreen>
             title: _videos[index].title,
             shouldPlay: index == _currentIndex,
             index: index,
-            currentIndex: _currentIndex, // Pass current index for lazy init logic
+            currentIndex: _currentIndex,
             total: _videos.length,
           );
         },
+      ),
+      bottomNavigationBar: Theme(
+        data: ThemeData(
+          splashColor: Colors.transparent,
+          highlightColor: Colors.transparent,
+        ),
+        child: BottomNavigationBar(
+          backgroundColor: Colors.black,
+          selectedItemColor: Colors.white,
+          unselectedItemColor: Colors.white54,
+          type: BottomNavigationBarType.fixed,
+          showSelectedLabels: true,
+          showUnselectedLabels: true,
+          selectedFontSize: 10,
+          unselectedFontSize: 10,
+          currentIndex: 0,
+          items: [
+            const BottomNavigationBarItem(icon: Icon(Icons.home_filled), label: 'Home'),
+            const BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Discover'),
+            BottomNavigationBarItem(
+              icon: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.add, color: Colors.black, size: 20),
+              ),
+              label: '',
+            ),
+            const BottomNavigationBarItem(icon: Icon(Icons.message_outlined), label: 'Inbox'),
+            const BottomNavigationBarItem(icon: Icon(Icons.person_outline), label: 'Profile'),
+          ],
+        ),
       ),
     );
   }
