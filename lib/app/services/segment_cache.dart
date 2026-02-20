@@ -278,4 +278,19 @@ class SegmentCache {
       }
     } catch (_) {}
   }
+
+  /// Trims the memory cache aggressively (e.g., keeping only recent items),
+  /// with a staggered delay to "split" the garbage collection load.
+  Future<void> trimMemoryStaggered() async {
+    const targetSize = 25; // keep 25 segments in memory
+    if (_memoryCache.length <= targetSize) return;
+
+    LoggerService.i('[SegmentCache] 🧹 Trimming memory cache (staggered)...');
+    while (_memoryCache.length > targetSize) {
+      _memoryCache.remove(_memoryCache.keys.first);
+      // Wait to split resource cleanup across frames
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    LoggerService.i('[SegmentCache] ✅ Memory trim complete. Current: ${_memoryCache.length}');
+  }
 }

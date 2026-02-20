@@ -5,6 +5,7 @@ import '../model/video_model.dart';
 import '../../repository/video_repository.dart';
 import '../../services/video_preload_manager.dart';
 import '../../services/video_controller_pool.dart';
+import '../../services/hls_cache_manager.dart';
 
 class HomeController extends GetxController {
   final VideoRepository _repository = VideoRepository();
@@ -107,6 +108,27 @@ class HomeController extends GetxController {
         }
     }
 
+    _manageResources(index);
+
     debugPrint('[HomeController] 📄 Page $index — window=$windowSize (${msSinceLast}ms since last swipe)');
+  }
+
+  void _manageResources(int currentIndex) {
+    if (currentIndex > 0 && currentIndex % 10 == 0) {
+      final keepUrls = <String>{};
+      // Keep current, 4 ahead, 2 behind
+      for (int i = -2; i <= 4; i++) {
+        final idx = currentIndex + i;
+        if (idx >= 0 && idx < videos.length) {
+          keepUrls.add(videos[idx].url);
+        }
+      }
+
+      // Fire and forget
+      VideoControllerPool.instance.trimCache(keepUrls).ignore();
+      if (HlsCacheManager.instance.isInitialized) {
+        HlsCacheManager.instance.cache.trimMemoryStaggered().ignore();
+      }
+    }
   }
 }

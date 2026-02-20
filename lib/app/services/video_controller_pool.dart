@@ -369,4 +369,55 @@ class VideoControllerPool {
 
   String _shortUrl(String url) =>
       url.length > 40 ? '…${url.substring(url.length - 40)}' : url;
+
+  // ---------------------------------------------------------------------------
+  // Resource Management
+  // ---------------------------------------------------------------------------
+
+  /// Releases controllers not in the [keepUrls] set.
+  /// Runs async with deliberate 150ms pauses between disposals so we do
+  /// not block the main isolate and drop frames while scrolling.
+  Future<void> trimCache(Set<String> keepUrls) async {
+    final toDisposeUrls = <String>{};
+
+    for (final url in _controllers.keys) {
+      if (!keepUrls.contains(url)) {
+        toDisposeUrls.add(url);
+      }
+    }
+    for (final url in _suspended.keys) {
+      if (!keepUrls.contains(url)) {
+        toDisposeUrls.add(url);
+      }
+    }
+
+    if (toDisposeUrls.isEmpty) return;
+
+    LoggerService.i(
+      '[VideoPool] 🧹 Trimming ${toDisposeUrls.length} stale controllers (staggered)...'
+    );
+
+    for (final url in toDisposeUrls) {
+      final active = _controllers.remove(url);
+      if (active != null) {
+        _savePosition(url, active);
+        active.dispose();
+      }
+
+      final susp = _suspended.remove(url);
+      if (susp != null) {
+        _savePosition(url, susp);
+        susp.dispose();
+      }
+
+      // Deliberate sleep: gives the UI thread a breather.
+      // This "splits" the heavy hardware decoder release across multiple frames.
+      // 150ms guarantees no stuttering / loaders while preserving app CPU
+      await Future.delayed(const Duration(milliseconds: 150));
+    }
+
+    LoggerService.i(
+      '[VideoPool] ✅ Trim complete. Active=${_controllers.length} Suspended=${_suspended.length}'
+    );
+  }
 }
