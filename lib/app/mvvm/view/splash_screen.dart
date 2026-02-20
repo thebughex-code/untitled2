@@ -1,4 +1,4 @@
-import 'dart:async';
+// dart:async no longer needed — TimeoutException removed with the .timeout() anti-pattern
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -79,30 +79,41 @@ class _SplashScreenState extends State<SplashScreen>
           if (jsonList.isNotEmpty) {
             final firstUrl = jsonList.first['url'] as String?;
             if (firstUrl != null && firstUrl.isNotEmpty) {
-              LoggerService.d('[Splash] 2/2 🔥 Stealth Pre-Warming Hardware Decoder for: $firstUrl');
-              final warmStart = DateTime.now();
-              
-              // We do not wait for the video to fully download, we just force the 
-              // hardware decoder to allocate memory and init the Extractor.
-              await VideoControllerPool.instance
+              LoggerService.d('[Splash] 🔥 Fire-and-forget pre-warm for: $firstUrl');
+
+              // ── Expert approach: NEVER use .timeout() here. ──
+              //
+              // The old code used .await + .timeout(1000ms). When the timeout
+              // fired, it threw a TimeoutException while the underlying
+              // controller.initialize() kept running inside _pendingCreations.
+              // That errored future was left as a "ghost" — the next caller
+              // (VideoPlayerWidget) would receive the same stale error and
+              // show the Retry button even when fully online and cached.
+              //
+              // The correct approach: fire-and-forget (unawaited).
+              //   - The controller initializes concurrently in the background.
+              //   - The 1500ms branding delay in _start() governs navigation.
+              //   - If init finishes before navigation → pool hit, 0ms load.
+              //   - If init is still running when HomeScreen loads → 
+              //     VideoPlayerWidget calls getControllerFor(), which finds the 
+              //     same future in _pendingCreations and naturally piggybacks 
+              //     on the in-progress init with zero retries needed.
+              //   - There is no timeout, no ghost, no error.
+              VideoControllerPool.instance
                   .getControllerFor(firstUrl)
-                  .timeout(const Duration(milliseconds: 1000));
-                  
-              LoggerService.i(
-                '[Splash] ✅ Hardware Decoder Warmed Up '
-                '(${DateTime.now().difference(warmStart).inMilliseconds} ms)',
-              );
+                  .then((_) {
+                    LoggerService.i('[Splash] ✅ Pre-warm complete (ran in background)');
+                  })
+                  .onError((e, _) {
+                    // Errors are silently swallowed — VideoPlayerWidget's own
+                    // 3-attempt retry loop handles recovery on the HomeScreen.
+                    LoggerService.w('[Splash] ⚠️ Pre-warm failed (retry will handle): $e');
+                  });
             }
           }
         }
       } catch (e) {
-        // If the stealth prewarm fails (slow internet, corrupted cache, etc),
-        // we silently swallow it so the app still boots successfully.
-        if (e is TimeoutException) {
-          LoggerService.w('[Splash] ⏱ Pre-warm hardware timeout (Skipping gracefully).');
-        } else {
-          LoggerService.w('[Splash] ⚠️ Pre-warm hardware skipped: $e');
-        }
+        LoggerService.w('[Splash] ⚠️ Pre-warm setup skipped: $e');
       }
 
     } catch (e) {

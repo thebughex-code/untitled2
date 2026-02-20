@@ -43,7 +43,12 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   bool _showPlayIcon = false;
   bool _isBuffering = false;
   bool _widgetDisposed = false;
-  
+
+  /// True once _safePlay() has been called at least once on this controller.
+  /// Keeps the thumbnail visible over the VideoPlayer surface until ExoPlayer
+  /// renders its first frame — prevents the black flash between attach & play.
+  bool _videoStarted = false;
+
   /// True if the controller was just restored from a saved position.
   /// Triggers a one-time seekTo in _safePlay to refresh iOS rendering.
   bool _isRestored = false;
@@ -53,10 +58,18 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   bool get wantKeepAlive => true;
 
   // -------------------------------------------------------------------------
-  // Lifecycle
+  // Helpers
   // -------------------------------------------------------------------------
 
-  bool get _isCurrentVideo => Get.find<HomeController>().currentIndex.value == widget.index;
+  bool get _isCurrentVideo =>
+      Get.find<HomeController>().currentIndex.value == widget.index;
+
+  /// Derives the thumbnail URL from the HLS master playlist URL.
+  /// Pattern: replace `master.m3u8` with `thumbnail.jpg`.
+  /// e.g. https://fu.fuzzin.com/posts/{uuid}/master.m3u8
+  ///   →  https://fu.fuzzin.com/posts/{uuid}/thumbnail.jpg
+  String get _thumbnailUrl =>
+      widget.videoUrl.replaceAll('master.m3u8', 'thumbnail.jpg');
 
   late final Worker _indexListener;
 
@@ -67,18 +80,35 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
     VideoControllerPool.instance.globalVolume.addListener(_onVolumeChanged);
     _tryInitialize();
 
-    // The single most important optimization:
-    // This widget never rebuilds. It simply listens to the global index 
-    // and tells its internal native video player to start/stop.
+    // ── THE KEY FIX: Eager controller attachment ──────────────────────────────
+    // Previously, `_tryInitialize()` was ONLY called when this widget became
+    // the CURRENT video. Nearby videos (distance 1-2) only called `pause()`
+    // and never attached their pre-warmed controllers from the pool.
+    //
+    // Result: every video had to wait until the user LANDED on it before
+    // even starting to attach the controller — causing the black screen flash
+    // for both forward AND reverse scrolling.
+    //
+    // Fix: nearby videos (distance ≤ 2) proactively call `_tryInitialize()`
+    // on EVERY index change. By the time the user swipes to them, the
+    // controller is already attached and ready — zero-latency instant play.
     _indexListener = ever(Get.find<HomeController>().currentIndex, (int newIndex) {
+      final distance = (widget.index - newIndex).abs();
+
       if (newIndex == widget.index) {
-        if (_state == PlayerState.ready) {
-           VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+        // This IS the current video — play it
+        if (_state == PlayerState.ready && _controller != null) {
+          VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
           _safePlay();
         } else {
-           _tryInitialize();
+          _tryInitialize();
         }
+      } else if (distance <= 2 && _state != PlayerState.ready) {
+        // This video is 1-2 away and NOT yet ready — eagerly attach its
+        // pre-warmed controller from the pool right now, before user arrives.
+        _tryInitialize();
       } else {
+        // Far away or already ready (just keep paused)
         _controller?.pause();
       }
     });
@@ -171,11 +201,18 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
         final controller =
             await VideoControllerPool.instance.getControllerFor(targetUrl);
 
-        // Re-check after the async await gap
+        // Re-check after the async await gap.
+        // Abort ONLY if scrolled far away (> 2 positions).
+        // Using > 2 (not > 1) explicitly allows distance-2 pre-warm to
+        // complete attachment — the previous > 1 guard was the root cause
+        // of the loader on every video: controllers were created but never
+        // attached to their widgets until the user physically arrived.
         if (!mounted || _widgetDisposed || widget.videoUrl != targetUrl) return;
-        if ((widget.index -
-                Get.find<HomeController>().currentIndex.value)
-            .abs() > 1) return;
+        final distanceAfter =
+            (widget.index - Get.find<HomeController>().currentIndex.value).abs();
+        if (distanceAfter > 2) {
+          return;
+        }
 
         _attachController(controller);
         return; // ✅ Success — exit the retry loop
@@ -202,11 +239,12 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
 
   void _attachController(VideoPlayerController c) {
     _controller?.removeListener(_onControllerUpdate);
-    
+
     setState(() {
       _controller = c;
       _state = PlayerState.ready;
       _isRestored = true;
+      _videoStarted = false; // thumbnail stays visible until _safePlay() fires
     });
 
     _controller!.setLooping(true);
@@ -244,6 +282,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
         _controller = null;
         _state = PlayerState.loading;
         _isBuffering = false;
+        _videoStarted = false; // reset so thumbnail shows on next attach
       });
     }
   }
@@ -273,6 +312,10 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       }
 
       if (!_widgetDisposed && _controller != null) {
+        // Lift the thumbnail poster — video is now playing
+        if (mounted && !_videoStarted) {
+          setState(() => _videoStarted = true);
+        }
         await _controller!.play();
       }
     } catch (e) {
@@ -334,6 +377,12 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
             else
               _buildLoadingOverlay(),
 
+            // Thumbnail poster: stays visible until first _safePlay() call.
+            // Prevents the black ExoPlayer surface from showing between
+            // controller attach and the first decoded frame.
+            if (_state == PlayerState.ready && !_videoStarted)
+              _buildLoadingOverlay(),
+
             // Buffering ----------------------------------------------------
             if (_state == PlayerState.ready && _isBuffering)
               const Center(
@@ -359,8 +408,9 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
                 ),
               ),
 
-            // Progress bar -------------------------------------------------
-            if (_state == PlayerState.ready && _controller != null)
+            // Progress bar — only for the actively playing video ----------
+            if (_state == PlayerState.ready && _controller != null
+                && _isCurrentVideo && _videoStarted)
               Positioned(
                 left: 0,
                 right: 0,
@@ -383,15 +433,34 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   }
 
   Widget _buildLoadingOverlay() {
-    return Container(
-      color: Colors.grey[900],
-      child: const Center(
-        child: SizedBox(
-          width: 40,
-          height: 40,
-          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white24),
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // Poster frame: real thumbnail from backend
+        Image.network(
+          _thumbnailUrl,
+          fit: BoxFit.cover,
+          width: double.infinity,
+          height: double.infinity,
+          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+            if (wasSynchronouslyLoaded || frame != null) return child;
+            return const ColoredBox(color: Colors.black);
+          },
+          errorBuilder: (context, e, _) => const ColoredBox(color: Colors.black),
         ),
-      ),
+
+        // TikTok-style spinner: small, centered, white, subtle
+        const Center(
+          child: SizedBox(
+            width: 36,
+            height: 36,
+            child: CircularProgressIndicator(
+              strokeWidth: 2.5,
+              color: Colors.white70,
+            ),
+          ),
+        ),
+      ],
     );
   }
 

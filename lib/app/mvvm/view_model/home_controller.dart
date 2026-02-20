@@ -82,12 +82,27 @@ class HomeController extends GetxController {
       windowSize: windowSize,
     );
 
-    // Proactively pre-warm controllers for next 1 video (saving decoders)
-    for (int i = 1; i <= 1; i++) {
+    // ── Proactive controller pre-warm: next +4 videos ──────────────────────
+    // Fire-and-forget initialization for the next 4 videos.
+    // VideoPreloadManager ALSO fires pre-warms post-segment-caching, so
+    // between these two sources every forward video is warmed well before
+    // the user gets there — eliminating the black screen after index 6.
+    for (int i = 1; i <= 4; i++) {
         final nextIdx = index + i;
         if (nextIdx < videos.length) {
             VideoControllerPool.instance
                 .getControllerFor(videos[nextIdx].url)
+                .ignore();
+        }
+    }
+
+    // ── Backward pre-warm: previous 2 videos ────────────────────────────────
+    // Ensures reverse-scrolling is also instant via the suspend pool.
+    for (int i = 1; i <= 2; i++) {
+        final prevIdx = index - i;
+        if (prevIdx >= 0) {
+            VideoControllerPool.instance
+                .getControllerFor(videos[prevIdx].url)
                 .ignore();
         }
     }

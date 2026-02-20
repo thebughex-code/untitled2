@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'proxy_server.dart';
 import '../services/logger_service.dart';
+import '../services/video_controller_pool.dart';
 
 enum PreloadPriority { critical, high, medium, low }
 
@@ -288,6 +289,20 @@ class VideoPreloadManager {
           '[PreloadManager] ✅ Cached $downloaded/${toFetch.length} segments '
           'for $url in ${elapsed}ms',
         );
+
+        // ── Controller Pre-Warm ──────────────────────────────────────────────
+        // Now that HLS segments are on disk, fire the hardware decoder warm-up
+        // immediately as a fire-and-forget. By the time the user swipes to
+        // this video, the decoder will already be allocated — 0ms spinner.
+        //
+        // This is the KEY fix for "black screen after index 6": the controller
+        // used to only be initialized reactively when the widget became visible.
+        // Now it initializes proactively in the background, as soon as segments
+        // are cached, regardless of what the user is currently watching.
+        VideoControllerPool.instance
+            .getControllerFor(url)
+            .then((_) => LoggerService.d('[PreloadManager] 🔥 Controller pre-warmed for ...${url.length > 30 ? url.substring(url.length - 30) : url}'))
+            .onError((e, _) {}); // Silently ignore — VideoPlayerWidget retry handles it
       }
     } catch (e) {
       LoggerService.e('[PreloadManager] Error/cancelled $url: $e');
