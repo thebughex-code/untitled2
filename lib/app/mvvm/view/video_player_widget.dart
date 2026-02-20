@@ -1,11 +1,14 @@
 import 'dart:async';
 
+import 'package:get/get.dart';
+
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
-import '../core/video/video_controller_pool.dart';
-import '../core/services/logger_service.dart';
-import 'widgets/video_overlay_ui.dart';
+import '../view_model/home_controller.dart';
+import '../../services/video_controller_pool.dart';
+import '../../services/logger_service.dart';
+import '../../widgets/video_overlay_ui.dart';
 
 enum PlayerState {
   loading,
@@ -20,19 +23,13 @@ enum PlayerState {
 class VideoPlayerWidget extends StatefulWidget {
   final String videoUrl;
   final String title;
-  final bool shouldPlay;
   final int index;
-  final int currentIndex;
-  final int total;
 
   const VideoPlayerWidget({
     super.key,
     required this.videoUrl,
     required this.title,
-    required this.shouldPlay,
     required this.index,
-    required this.currentIndex,
-    required this.total,
   });
 
   @override
@@ -59,12 +56,32 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   // Lifecycle
   // -------------------------------------------------------------------------
 
+  bool get _isCurrentVideo => Get.find<HomeController>().currentIndex.value == widget.index;
+
+  late final Worker _indexListener;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     VideoControllerPool.instance.globalVolume.addListener(_onVolumeChanged);
     _tryInitialize();
+
+    // The single most important optimization:
+    // This widget never rebuilds. It simply listens to the global index 
+    // and tells its internal native video player to start/stop.
+    _indexListener = ever(Get.find<HomeController>().currentIndex, (int newIndex) {
+      if (newIndex == widget.index) {
+        if (_state == PlayerState.ready) {
+           VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+          _safePlay();
+        } else {
+           _tryInitialize();
+        }
+      } else {
+        _controller?.pause();
+      }
+    });
   }
 
   void _onVolumeChanged() {
@@ -75,14 +92,14 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && _state == PlayerState.ready && widget.shouldPlay) {
+    if (state == AppLifecycleState.resumed && _state == PlayerState.ready && _isCurrentVideo) {
       _isRestored = true; 
       _safePlay();
     }
   }
 
   void _tryInitialize() {
-    final distance = (widget.index - widget.currentIndex).abs();
+    final distance = (widget.index - Get.find<HomeController>().currentIndex.value).abs();
 
     // ── Distance guard: too far away, evict ────────────────────────────────
     if (distance > 2) {
@@ -99,10 +116,10 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
     if (_state == PlayerState.ready && _controller != null) {
       try {
         if (_controller!.value.isInitialized) {
-          if (widget.index == widget.currentIndex) {
+          if (_isCurrentVideo) {
             VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
+            _safePlay();
           }
-          if (widget.shouldPlay) _safePlay();
           return;
         }
       } catch (_) {
@@ -122,29 +139,63 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
     _initPlayer();
   }
 
+  /// Initializes the video player controller.
+  ///
+  /// Uses exponential backoff auto-retry (up to [_maxRetries]) before
+  /// ever showing the error UI. This handles:
+  ///   • Transient network blips during `controller.initialize()`
+  ///   • Proxy cold-start latency on the first request
+  ///   • Ghost controller edge cases from the splash pre-warm timeout
+  static const int _maxRetries = 3;
+
   Future<void> _initPlayer() async {
     if (_state == PlayerState.ready && _controller != null) return;
-    
+
     final targetUrl = widget.videoUrl;
 
-    if (widget.index == widget.currentIndex) {
-        VideoControllerPool.instance.setCurrentUrl(targetUrl);
+    if (_isCurrentVideo) {
+      VideoControllerPool.instance.setCurrentUrl(targetUrl);
     }
 
-    try {
-      final controller = await VideoControllerPool.instance.getControllerFor(targetUrl);
+    int attempt = 0;
+    const delays = [500, 1000, 2000]; // ms: 0.5s → 1s → 2s
 
-      // Race condition checks
-      if (!mounted || widget.videoUrl != targetUrl) return; 
+    while (attempt < _maxRetries) {
+      // Abort immediately if the widget was disposed or scrolled away.
+      if (!mounted || _widgetDisposed || widget.videoUrl != targetUrl) return;
+      final distance =
+          (widget.index - Get.find<HomeController>().currentIndex.value).abs();
+      if (distance > 2) return; // Too far away — don't waste bandwidth
 
-      final distance = (widget.index - widget.currentIndex).abs();
-      if (distance > 1) return; // Too far away now
+      try {
+        final controller =
+            await VideoControllerPool.instance.getControllerFor(targetUrl);
 
-      _attachController(controller);
-    } catch (e) {
-      debugPrint('[VideoPlayer] init failed for $targetUrl: $e');
-      if (mounted && !_widgetDisposed) {
-        setState(() => _state = PlayerState.error);
+        // Re-check after the async await gap
+        if (!mounted || _widgetDisposed || widget.videoUrl != targetUrl) return;
+        if ((widget.index -
+                Get.find<HomeController>().currentIndex.value)
+            .abs() > 1) return;
+
+        _attachController(controller);
+        return; // ✅ Success — exit the retry loop
+      } catch (e) {
+        attempt++;
+        debugPrint(
+          '[VideoPlayer] ⚠️ init attempt $attempt/$_maxRetries failed for '
+          '${targetUrl.substring(targetUrl.length > 40 ? targetUrl.length - 40 : 0)}: $e',
+        );
+
+        if (attempt >= _maxRetries) {
+          // All retries exhausted — show error UI
+          if (mounted && !_widgetDisposed) {
+            setState(() => _state = PlayerState.error);
+          }
+          return;
+        }
+
+        // Exponential backoff — wait before next attempt
+        await Future.delayed(Duration(milliseconds: delays[attempt - 1]));
       }
     }
   }
@@ -167,11 +218,8 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
       if (mounted) setState(() {});
     });
 
-    if (widget.index == widget.currentIndex) {
+    if (_isCurrentVideo) {
       VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
-    }
-    
-    if (widget.shouldPlay) {
       _safePlay();
     }
   }
@@ -202,6 +250,7 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
 
   @override
   void dispose() {
+    _indexListener.dispose();
     WidgetsBinding.instance.removeObserver(this);
     VideoControllerPool.instance.globalVolume.removeListener(_onVolumeChanged);
     _iconTimer?.cancel();
@@ -235,16 +284,11 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
   @override
   void didUpdateWidget(covariant VideoPlayerWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    
-    if (widget.currentIndex != oldWidget.currentIndex) {
-      if (widget.index == widget.currentIndex) {
-           VideoControllerPool.instance.setCurrentUrl(widget.videoUrl);
-      }
+    // Widgets never physically update based on scroll index anymore, 
+    // so this is largely unused for playback logic.
+    if (widget.videoUrl != oldWidget.videoUrl) {
+      _clearController();
       _tryInitialize();
-    }
-
-    if (widget.shouldPlay != oldWidget.shouldPlay && _state == PlayerState.ready) {
-      widget.shouldPlay ? _safePlay() : _controller?.pause();
     }
   }
 
@@ -277,16 +321,12 @@ class _VideoPlayerWidgetState extends State<VideoPlayerWidget> with AutomaticKee
           children: [
             // Video surface ------------------------------------------------
             if (_state == PlayerState.ready && _controller != null)
-              AnimatedOpacity(
-                opacity: 1.0,
-                duration: const Duration(milliseconds: 300),
-                child: Center(
-                  child: AspectRatio(
-                    aspectRatio: _controller!.value.aspectRatio == 0
-                        ? 16 / 9
-                        : _controller!.value.aspectRatio,
-                    child: VideoPlayer(_controller!),
-                  ),
+              Center(
+                child: AspectRatio(
+                  aspectRatio: _controller!.value.aspectRatio == 0
+                      ? 16 / 9
+                      : _controller!.value.aspectRatio,
+                  child: VideoPlayer(_controller!),
                 ),
               )
             else if (_state == PlayerState.error)

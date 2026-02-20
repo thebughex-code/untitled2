@@ -4,9 +4,9 @@ import 'dart:collection';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 
-import '../../core/hls/hls_cache_manager.dart';
-import '../services/logger_service.dart';
-import '../../main.dart'; // To access the global proxy
+import 'hls_cache_manager.dart';
+import 'logger_service.dart';
+// Note: no main.dart import needed here.
 
 /// Manages a pool of VideoPlayerControllers to optimize resources and memory.
 ///
@@ -27,9 +27,10 @@ class VideoControllerPool {
   /// This prevents the "loader on back-scroll" bug while staying within
   /// Android decoder limits (3 simultaneous decoders is safe on all devices ≥2020).
   /// Maximum number of controllers to keep in memory.
-  /// 3 = current + 1 forward + 1 backward.
-  /// This prevents decoder limits (pipelineFull) while keeping minimum smooth scrolling.
-  int maxSize = 3;
+  /// 5 = current + 2 forward + 1 backward + 1 safety.
+  /// Must be >= HomeController.windowSize (4) to prevent infinite eviction loops
+  /// where all protected controllers fill the pool and nothing can be evicted.
+  int maxSize = 5;
 
   /// Global volume state. 0.0 means muted, 1.0 means full volume.
   /// Videos should listen to this notifier to sync mute state instantly.
@@ -45,7 +46,10 @@ class VideoControllerPool {
       LinkedHashMap();
 
   /// Saved playback positions for evicted videos.
-  final Map<String, Duration> _savedPositions = {};
+  /// Capped at 50 entries (LRU) to prevent unbounded memory growth
+  /// in long sessions where users scroll through hundreds of videos.
+  final LinkedHashMap<String, Duration> _savedPositions = LinkedHashMap<String, Duration>();
+  static const int _maxSavedPositions = 50;
 
   /// The currently active video URL (to prevent evicting the playing video).
   String? _currentUrl;
@@ -78,17 +82,14 @@ class VideoControllerPool {
 
   /// Returns an existing controller for [url] or creates a new one.
   ///
-  /// If created, it tries to restore the last known position.
-  /// Tracks in-flight controller creations to prevent race conditions.
+  /// De-duplicates concurrent requests so only ONE `controller.initialize()` 
+  /// ever runs per URL. On failure the entry is immediately removed from
+  /// `_pendingCreations` so the next retry always starts a fresh attempt.
   final Map<String, Future<VideoPlayerController>> _pendingCreations = {};
 
-  /// Returns an existing controller for [url] or creates a new one.
-  ///
-  /// If created, it tries to restore the last known position.
   Future<VideoPlayerController> getControllerFor(String url) async {
     // 1. Check if we already have it
     if (_controllers.containsKey(url)) {
-      // Move to end (most recently used)
       final controller = _controllers.remove(url)!;
       _controllers[url] = controller;
       return controller;
@@ -99,22 +100,26 @@ class VideoControllerPool {
       return _pendingCreations[url]!;
     }
 
-    // 3. Create new controller (wrapped in a future to allow deduplication)
+    // 3. Create new controller
     final future = _createController(url);
     _pendingCreations[url] = future;
 
     try {
       final controller = await future;
-      
-      // 4. Add to pool (and evict if necessary)
       _controllers[url] = controller;
       _enforceMaxSize();
-      
       return controller;
     } catch (e) {
+      // ⚠️ Remove from pending BEFORE rethrowing so the next retry gets a
+      // fresh creation, not the stale errored future.
+      // Without this, a TimeoutException from the splash pre-warm leaves an
+      // errored future parked in _pendingCreations forever, causing every
+      // subsequent VideoPlayerWidget init to fail instantly with the
+      // same error and show the Retry button even when online.
+      _pendingCreations.remove(url);
       rethrow;
     } finally {
-      // 5. Clean up pending map
+      // Success path cleanup (no-op if catch already removed it)
       _pendingCreations.remove(url);
     }
   }
@@ -269,6 +274,10 @@ class VideoControllerPool {
   void _savePosition(String url, VideoPlayerController controller) {
     final pos = controller.value.position;
     if (pos > Duration.zero) {
+      // LRU eviction: remove oldest entry if at capacity
+      if (_savedPositions.length >= _maxSavedPositions) {
+        _savedPositions.remove(_savedPositions.keys.first);
+      }
       _savedPositions[url] = pos;
     }
   }

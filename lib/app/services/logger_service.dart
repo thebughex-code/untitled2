@@ -60,7 +60,7 @@ class CustomPrinter extends LogPrinter {
             Level.info: AnsiColor.fg(200), 
             Level.warning: AnsiColor.fg(214), 
             Level.error: AnsiColor.fg(197), 
-            Level.wtf: AnsiColor.fg(200), 
+            Level.fatal: AnsiColor.fg(200), 
           },
           levelEmojis: {
             Level.trace: '💜 ',
@@ -68,7 +68,7 @@ class CustomPrinter extends LogPrinter {
             Level.info: '🩵 ',
             Level.warning: '⚡ ',
             Level.error: '⛔ ',
-            Level.wtf: '🔥 ',
+            Level.fatal: '🔥 ',
           },
         );
 

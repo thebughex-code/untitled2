@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 
@@ -60,8 +61,22 @@ class ProxyServer {
   /// Track cancel tokens to allow aborting requests if the user swipes away quickly.
   final Map<String, CancelToken> _cancelTokens = {};
 
-  /// In-memory cache for rewritten manifests.
-  final Map<String, Uint8List> _manifestCache = {};
+  /// LRU in-memory cache for rewritten manifests.
+  /// Strictly capped at [_maxManifestCacheEntries] to prevent OOM on long sessions.
+  /// Using LinkedHashMap for O(1) LRU eviction (insertion-order = access-order).
+  final LinkedHashMap<String, Uint8List> _manifestCache = LinkedHashMap<String, Uint8List>();
+  static const int _maxManifestCacheEntries = 100;
+
+  /// LRU put helper for [_manifestCache].
+  ///
+  /// Evicts the least-recently-used entry when the cap is reached.
+  void _putManifest(String key, Uint8List data) {
+    _manifestCache.remove(key); // Remove old entry if it exists (re-insert at end)
+    if (_manifestCache.length >= _maxManifestCacheEntries) {
+      _manifestCache.remove(_manifestCache.keys.first); // Evict LRU
+    }
+    _manifestCache[key] = data;
+  }
 
   /// In-memory cache for segment URL lists (used by PreloadManager).
   final Map<String, List<String>> _segmentListCache = {};
@@ -136,7 +151,7 @@ class ProxyServer {
     // IMPORTANT: If the client (VideoPlayer) disconnects early, we should cancel
     // the downstream fetching to save total bandwidth.
     // We attach a listener to the client connection.
-    final clientSubscription = request.response.done.catchError((_) {}).then((_) {
+    request.response.done.catchError((_) {}).then((_) {
        // If the proxy finished properly, this is a no-op.
        // If the player closed the connection early, this gives us a hook.
     });
@@ -165,47 +180,56 @@ class ProxyServer {
   Future<void> _handleManifest(HttpRequest request, String url) async {
     final cacheKey = 'manifest:$url';
 
-    // 1. Serve from memory cache (Fastest)
+    // 1. Serve from memory cache (Fastest — 0ms)
     if (_manifestCache.containsKey(cacheKey)) {
       LoggerService.d('[ProxyServer] 🚀 Serving MANIFEST from MEMORY: $url');
       _writeManifestResponse(request, _manifestCache[cacheKey]!);
       return;
     }
 
-    // 2. Serve from disk cache (Fallback)
+    // 2. Serve from disk cache (Offline-first — survives app restarts)
     final cached = await cache.get(cacheKey);
     if (cached != null) {
-      LoggerService.i('[ProxyServer] 📦 Serving MANIFEST from DISK: $url');
-      _manifestCache[cacheKey] = cached; // Promote to memory
+      LoggerService.i('[ProxyServer] 📦 Serving MANIFEST from DISK CACHE: $url');
+      _putManifest(cacheKey, cached); // Promote to memory (re-inserts at MRU end)
       _writeManifestResponse(request, cached);
       return;
     }
 
-    // 2. Download original manifest
+    // 3. Download original manifest (requires network)
     final data = await _downloadWithTimeout(url);
     if (data == null) {
-      LoggerService.w('[ProxyServer] Failed to fetch manifest: $url. Redirecting to upstream.');
-      // FALLBACK: Redirect to original URL so player can try directly
-      request.response.redirect(Uri.parse(url), status: HttpStatus.movedTemporarily);
+      // The device is offline AND the manifest was not in disk cache.
+      // Do NOT redirect — the original URL is also unreachable offline.
+      // Return a proper 503 so the VideoPlayer shows a clean Retry button.
+      LoggerService.w('[ProxyServer] ⚠️ Manifest unavailable offline and not cached: $url');
+      try {
+        request.response.statusCode = HttpStatus.serviceUnavailable;
+        request.response.write('Offline — manifest not cached');
+        await request.response.close();
+      } catch (_) {}
       return;
     }
 
     final content = utf8.decode(data, allowMalformed: true);
 
-    // 3. Parse & rewrite
+    // 4. Parse & rewrite (on background isolate to keep UI thread unblocked)
+    final payload = ManifestParsePayload(content, url, baseUrl);
     ManifestResult result;
+    
     if (ManifestParser.isMasterPlaylist(content)) {
-      result = ManifestParser.parseMasterPlaylist(content, url, baseUrl);
+      result = await compute(parseMasterPlaylistIsolate, payload);
     } else {
-      result = ManifestParser.parseMediaPlaylist(content, url, baseUrl);
+      result = await compute(parseMediaPlaylistIsolate, payload);
     }
 
     final rewritten = Uint8List.fromList(utf8.encode(result.rewrittenContent));
 
-    // 4. Cache rewritten manifest
-    await cache.put(cacheKey, rewritten);
+    // 5. Cache rewritten manifest to DISK so offline restarts can serve it
+    _putManifest(cacheKey, rewritten); // Memory (LRU bounded)
+    await cache.put(cacheKey, rewritten); // Permanent disk
 
-    // 5. Respond
+    // 6. Respond
     _writeManifestResponse(request, rewritten);
   }
 
@@ -255,7 +279,12 @@ class ProxyServer {
           request.response.headers
               .set('Content-Range', 'bytes $start-$clampedEnd/${data.length}');
           request.response.headers.contentLength = length;
-          request.response.add(data.sublist(start, clampedEnd + 1));
+          
+          // ZERO-TOLERANCE VM OPTIMIZATION:
+          // Instead of manually copying a 2MB array from RAM -> RAM during a Range request
+          // (data.sublist), we create a lightweight C-pointer view over the existing array. 
+          // 0 bytes reallocated. Perfect ExoPlayer streaming.
+          request.response.add(Uint8List.sublistView(data, start, clampedEnd + 1));
           await request.response.close();
           return;
         }
@@ -357,8 +386,8 @@ class ProxyServer {
       if (originalData != null) {
         final content = utf8.decode(originalData, allowMalformed: true);
         if (!ManifestParser.isMasterPlaylist(content)) {
-          final result =
-              ManifestParser.parseMediaPlaylist(content, url, baseUrl);
+          final payload = ManifestParsePayload(content, url, baseUrl);
+          final result = await compute(parseMediaPlaylistIsolate, payload);
           return result.segmentUrls;
         }
       }
@@ -373,12 +402,14 @@ class ProxyServer {
     // Cache original (for segment-URL extraction later)
     await cache.put('original:$url', data);
 
+    final payload = ManifestParsePayload(content, url, baseUrl);
     ManifestResult result;
+    
     if (ManifestParser.isMasterPlaylist(content)) {
-      result = ManifestParser.parseMasterPlaylist(content, url, baseUrl);
+      result = await compute(parseMasterPlaylistIsolate, payload);
       final rewritten =
           Uint8List.fromList(utf8.encode(result.rewrittenContent));
-      _manifestCache[cacheKey] = rewritten; // Cache in memory
+      _putManifest(cacheKey, rewritten); // Cache in memory (LRU)
       await cache.put(cacheKey, rewritten); // And disk
 
       // Pick first (lowest-bandwidth) variant for pre-loading
@@ -387,10 +418,10 @@ class ProxyServer {
       }
       return const [];
     } else {
-      result = ManifestParser.parseMediaPlaylist(content, url, baseUrl);
+      result = await compute(parseMediaPlaylistIsolate, payload);
       final rewritten =
           Uint8List.fromList(utf8.encode(result.rewrittenContent));
-      _manifestCache[cacheKey] = rewritten; // Cache in memory
+      _putManifest(cacheKey, rewritten); // Cache in memory (LRU)
       await cache.put(cacheKey, rewritten);
       
       final urls = result.segmentUrls;
@@ -444,7 +475,16 @@ class ProxyServer {
         final elapsed = DateTime.now().difference(start).inMilliseconds;
 
         if (response.statusCode != null && response.statusCode! >= 200 && response.statusCode! < 300) {
-          final bytes = Uint8List.fromList(response.data!);
+          // ZERO-TOLERANCE VM OPTIMIZATION:
+          // Dio ResponseType.bytes heavily uses Uint8List under the hood. 
+          // By checking the runtime type, we can instantly bridge the memory
+          // to our caching pipeline without triggering a `fromList` loop 
+          // that would copy 5,000,000 individual bytes and starve the GC.
+          final rawData = response.data;
+          final Uint8List bytes = rawData is Uint8List 
+              ? rawData 
+              : Uint8List.fromList(rawData as List<int>);
+
           LoggerService.d('[ProxyServer] Downloaded ${bytes.length} bytes in ${elapsed}ms: ...${url.substring(url.length - 15 > 0 ? url.length - 15 : 0)}');
           return bytes;
         }

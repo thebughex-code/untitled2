@@ -12,29 +12,29 @@ class VideoOverlayUI extends StatelessWidget {
     required this.title,
   });
 
+  // ── Precomputed decoration — created ONCE, never re-allocated ──
+  // Previously this was inside build(), causing a new BoxDecoration + LinearGradient
+  // to be allocated on every repaint, hitting the GC during fast scrolling.
+  static const _gradientDecoration = BoxDecoration(
+    gradient: LinearGradient(
+      begin: Alignment.topCenter,
+      end: Alignment.bottomCenter,
+      colors: [Colors.transparent, Color(0xB4000000)], // Colors.black.withAlpha(180)
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     return Stack(
       fit: StackFit.expand,
       children: [
         // Bottom gradient overlay
-        Positioned(
+        const Positioned(
           left: 0,
           right: 0,
           bottom: 0,
           height: 200,
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [
-                  Colors.transparent,
-                  Colors.black.withAlpha(180),
-                ],
-              ),
-            ),
-          ),
+          child: DecoratedBox(decoration: _gradientDecoration),
         ),
 
         // Title + User Info + Description
@@ -116,12 +116,10 @@ class VideoOverlayUI extends StatelessWidget {
             shape: BoxShape.circle,
             color: Colors.grey[800],
             border: Border.all(color: Colors.white, width: 1.5),
-            // Default placeholder if network image fails
-            image: const DecorationImage(
-              image: NetworkImage('https://picsum.photos/100/100'),
-              fit: BoxFit.cover,
-            ),
           ),
+          // Using a const standard icon instead of a NetworkImage 
+          // prevents creating 20 HTTP requests during a fast scroll.
+          child: const Icon(Icons.person, color: Colors.white60, size: 28),
         ),
         Positioned(
           bottom: -8,
@@ -162,3 +160,4 @@ class VideoOverlayUI extends StatelessWidget {
     );
   }
 }
+

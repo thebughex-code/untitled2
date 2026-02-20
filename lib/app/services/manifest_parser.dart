@@ -1,3 +1,12 @@
+/// Payload for passing arguments to isolate compute functions
+class ManifestParsePayload {
+  final String content;
+  final String manifestUrl;
+  final String proxyBaseUrl;
+
+  const ManifestParsePayload(this.content, this.manifestUrl, this.proxyBaseUrl);
+}
+
 /// Parses and rewrites HLS m3u8 manifests so that all URIs route through the
 /// local proxy server, enabling transparent caching of segments and
 /// sub-playlists.
@@ -12,40 +21,68 @@ class ManifestParser {
     return content.contains('#EXT-X-STREAM-INF') ||
         content.contains('#EXT-X-I-FRAME-STREAM-INF');
   }
+}
 
-  // ---------------------------------------------------------------------------
-  // Master playlist
-  // ---------------------------------------------------------------------------
+/// Internal helper class to sort HLS variants by Bandwidth for zero-latency booting.
+class _Variant {
+  final int bandwidth;
+  final String streamInfLine;
+  final String proxiedUrlLine;
+  final String absoluteUrl;
 
-  /// Parse a master playlist, rewriting every variant / I-frame URI to route
-  /// through the local proxy.
-  static ManifestResult parseMasterPlaylist(
-    String content,
-    String manifestUrl,
-    String proxyBaseUrl,
-  ) {
+  _Variant({
+    required this.bandwidth,
+    required this.streamInfLine,
+    required this.proxiedUrlLine,
+    required this.absoluteUrl,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Isolate-safe top-level parse functions
+// ---------------------------------------------------------------------------
+
+/// Parse a master playlist, rewriting every variant / I-frame URI to route
+/// through the local proxy. Safe to run in `compute()`.
+ManifestResult parseMasterPlaylistIsolate(ManifestParsePayload payload) {
+  final content = payload.content;
+  final manifestUrl = payload.manifestUrl;
+  final proxyBaseUrl = payload.proxyBaseUrl;
+
     final lines = content.split('\n');
     final buffer = StringBuffer();
-    final variantUrls = <String>[];
+    final variants = <_Variant>[];
 
     for (int i = 0; i < lines.length; i++) {
       final line = lines[i].trimRight();
 
       if (line.startsWith('#EXT-X-STREAM-INF')) {
-        buffer.writeln(line);
+        // Extract Bandwidth mathematically for sorting.
+        // Default to a massive number (999M) so unparsed variants fall to the bottom.
+        int bandwidth = 999000000;
+        final bwMatch = RegExp(r'BANDWIDTH=(\d+)').firstMatch(line);
+        if (bwMatch != null) {
+          bandwidth = int.tryParse(bwMatch.group(1) ?? '') ?? 999000000;
+        }
+
         // Next non-empty line is the variant URI.
         if (i + 1 < lines.length) {
           i++;
           final rawUrl = lines[i].trim();
           if (rawUrl.isEmpty) {
-            buffer.writeln(rawUrl);
             continue;
           }
           final absoluteUrl = _resolveUrl(manifestUrl, rawUrl);
-          variantUrls.add(absoluteUrl);
           final proxied =
               '/manifest.m3u8?url=${Uri.encodeComponent(absoluteUrl)}';
-          buffer.writeln(proxied);
+
+          // Store the variant logic in memory instead of writing it directly
+          variants.add(_Variant(
+            bandwidth: bandwidth,
+            streamInfLine: line,
+            proxiedUrlLine: proxied,
+            absoluteUrl: absoluteUrl,
+          ));
         }
       } else if (line.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
         // Rewrite the URI= attribute inline.
@@ -59,25 +96,37 @@ class ManifestParser {
       }
     }
 
+    // ── The TikTok Sorting Hack ──
+    // Sort all discovered variants by BANDWIDTH ASCENDING (Lowest to Highest).
+    // By artificially re-writing the Master Playlist to list 144p/240p as the
+    // very first stream, we force the ExoPlayer engine and Preloader to legally
+    // download the microscopic 100KB segment FIRST instead of a 20MB 4K segment.
+    // This allows the video to boot on 3G/Edge instantly.
+    variants.sort((a, b) => a.bandwidth.compareTo(b.bandwidth));
+
+    for (final variant in variants) {
+      buffer.writeln(variant.streamInfLine);
+      buffer.writeln(variant.proxiedUrlLine);
+    }
+
     return ManifestResult(
       rewrittenContent: buffer.toString(),
       segmentUrls: const [],
-      variantUrls: variantUrls,
+      variantUrls: variants.map((v) => v.absoluteUrl).toList(),
       isMaster: true,
     );
-  }
+}
 
-  // ---------------------------------------------------------------------------
-  // Media playlist
-  // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Media playlist
+// ---------------------------------------------------------------------------
 
-  /// Parse a media (variant) playlist. Segment and init-section URIs are
-  /// rewritten to the proxy's `/segment` endpoint.
-  static ManifestResult parseMediaPlaylist(
-    String content,
-    String manifestUrl,
-    String proxyBaseUrl,
-  ) {
+/// Parse a media (variant) playlist. Segment and init-section URIs are
+/// rewritten to the proxy's `/segment` endpoint. Safe to run in `compute()`.
+ManifestResult parseMediaPlaylistIsolate(ManifestParsePayload payload) {
+  final content = payload.content;
+  final manifestUrl = payload.manifestUrl;
+  final proxyBaseUrl = payload.proxyBaseUrl;
     final lines = content.split('\n');
     final buffer = StringBuffer();
     final segmentUrls = <String>[];
@@ -96,8 +145,11 @@ class ManifestParser {
           // Determine extension
           String extension = '.ts';
           final lower = rawUrl.toLowerCase();
-          if (lower.endsWith('.mp4')) extension = '.mp4';
-          else if (lower.endsWith('.m4s')) extension = '.m4s';
+          if (lower.endsWith('.mp4')) {
+            extension = '.mp4';
+          } else if (lower.endsWith('.m4s')) {
+            extension = '.m4s';
+          }
           
           final proxied =
               '/segment$extension?url=${Uri.encodeComponent(absoluteUrl)}';
@@ -120,8 +172,11 @@ class ManifestParser {
         // Determine extension
         String extension = '.ts';
         final lower = line.toLowerCase();
-        if (lower.endsWith('.mp4')) extension = '.mp4';
-        else if (lower.endsWith('.m4s')) extension = '.m4s';
+        if (lower.endsWith('.mp4')) {
+          extension = '.mp4';
+        } else if (lower.endsWith('.m4s')) {
+          extension = '.m4s';
+        }
 
         final proxied =
             '/segment$extension?url=${Uri.encodeComponent(absoluteUrl)}';
@@ -137,26 +192,26 @@ class ManifestParser {
       variantUrls: const [],
       isMaster: false,
     );
-  }
+}
 
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-  /// Resolve a possibly-relative [url] against [baseUrl].
-  static String _resolveUrl(String baseUrl, String url) {
+/// Resolve a possibly-relative [url] against [baseUrl].
+String _resolveUrl(String baseUrl, String url) {
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
     final base = Uri.parse(baseUrl);
     return base.resolve(url).toString();
   }
 
-  /// Rewrite the `URI="…"` attribute inside an HLS tag line.
-  static String _rewriteUriAttribute(
-    String line,
-    String manifestUrl,
-    String proxyBaseUrl, {
-    required bool isManifest,
-  }) {
+/// Rewrite the `URI="…"` attribute inside an HLS tag line.
+String _rewriteUriAttribute(
+  String line,
+  String manifestUrl,
+  String proxyBaseUrl, {
+  required bool isManifest,
+}) {
     final uriMatch = RegExp(r'URI="([^"]+)"').firstMatch(line);
     if (uriMatch == null) return line;
 
@@ -170,10 +225,15 @@ class ManifestParser {
       extension = '.m3u8';
     } else {
       final lower = rawUrl.toLowerCase();
-      if (lower.endsWith('.mp4')) extension = '.mp4';
-      else if (lower.endsWith('.m4s')) extension = '.m4s';
-      else if (lower.endsWith('.ts')) extension = '.ts';
-      else extension = '.ts'; // Default to ts for segments
+      if (lower.endsWith('.mp4')) {
+        extension = '.mp4';
+      } else if (lower.endsWith('.m4s')) {
+        extension = '.m4s';
+      } else if (lower.endsWith('.ts')) {
+        extension = '.ts';
+      } else {
+        extension = '.ts'; // Default to ts for segments
+      }
     }
 
     // Use relative URL (no scheme/host/port) so it works across restarts/port changes.
@@ -181,7 +241,6 @@ class ManifestParser {
     final proxied =
         '/$endpoint$extension?url=${Uri.encodeComponent(absoluteUrl)}';
     return line.replaceFirst(rawUrl, proxied);
-  }
 }
 
 /// Result of parsing/rewriting an m3u8 manifest.

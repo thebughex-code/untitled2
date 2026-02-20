@@ -1,16 +1,19 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
+import 'dart:convert';
 
-import '../core/hls/hls_cache_manager.dart';
-import '../core/hls/video_preload_manager.dart';
-import '../core/models/video_data.dart';
-import '../core/services/logger_service.dart';
-import '../core/video/video_controller_pool.dart';
-import 'video_feed_screen.dart';
+import 'package:flutter/material.dart';
+import 'package:get/get.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../../services/hls_cache_manager.dart';
+import '../../services/logger_service.dart';
+import '../../services/video_controller_pool.dart';
+import '../../routes/app_routes.dart';
 
 /// Branded splash screen shown while the HLS cache system boots up and the
 /// first batch of videos is pre-loaded.
 ///
-/// Once ready the splash navigates to [VideoFeedScreen].
+/// Once ready the splash navigates to [HomeScreen].
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -41,15 +44,9 @@ class _SplashScreenState extends State<SplashScreen>
       Future.delayed(const Duration(milliseconds: 1500)),
     ]);
     if (!mounted) return;
-    LoggerService.d('[Splash] 🚀 Navigating to VideoFeedScreen');
-    Navigator.of(context).pushReplacement(
-      PageRouteBuilder(
-        pageBuilder: (_, a, b) => const VideoFeedScreen(),
-        transitionsBuilder: (_, animation, c, child) =>
-            FadeTransition(opacity: animation, child: child),
-        transitionDuration: const Duration(milliseconds: 400),
-      ),
-    );
+    LoggerService.d('[Splash] 🚀 Navigating to HomeScreen');
+    
+    Get.offNamed(Routes.HOME);
   }
 
   /// Initialises the HLS cache and preloads the first 3 videos.
@@ -68,51 +65,46 @@ class _SplashScreenState extends State<SplashScreen>
         '(${DateTime.now().difference(hlsStart).inMilliseconds} ms)',
       );
 
-      final urls = VideoData.videos.map((v) => v.url).toList();
-      if (urls.isEmpty) return;
-
-      // Steps 2 & 3: segment preload + controller warm-up run concurrently.
-      LoggerService.d('[Splash] 2+3 Parallel: preload 3 videos + warm-up controllers 0 & 1…');
-      final parallelStart = DateTime.now();
-
-      bool timedOut = false;
-      await Future.wait([
-        // Task A – cache manifests + leading segments for first 3 videos.
-        VideoPreloadManager.instance
-            .preloadInitialBatch(urls, count: 3)
-            .timeout(
-          const Duration(seconds: 4), // hard cap — matches splash duration
-          onTimeout: () {
-            timedOut = true;
-            LoggerService.w('[Splash] ⏱ Segment preload timed out after 4 s');
-          },
-        ),
-
-        // Task B – warm up controllers for videos 0 AND 1 in parallel.
-        Future(() async {
-          try {
-            LoggerService.d('[Splash] 🔥 Warming up controllers for videos 0 & 1…');
-            final ctrlStart = DateTime.now();
-            final warmUrls = urls.take(2).toList();
-            await Future.wait(
-              warmUrls.map((u) => VideoControllerPool.instance.getControllerFor(u)),
-            );
-            LoggerService.i(
-              '[Splash] ✅ Controllers (${warmUrls.length}) ready '
-              '(${DateTime.now().difference(ctrlStart).inMilliseconds} ms)',
-            );
-          } catch (e) {
-            LoggerService.w('[Splash] ⚠️ Controller warm-up failed: $e');
+      // Step 2: Stealth Hardware Decoder Pre-Warming (The TikTok trick)
+      // While the user is staring at the Splash Screen logo for 1.5 seconds,
+      // the CPU is completely idle. We crack open SharedPreferences, grab the 
+      // URL of the FIRST video from the previous session, and instantly spin up 
+      // the iOS/Android hardware MediaCodec natively in the background. 
+      // This totally hides the 500ms physical hardware boot delay.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final cachedString = prefs.getString('cached_video_feed');
+        if (cachedString != null) {
+          final List<dynamic> jsonList = jsonDecode(cachedString);
+          if (jsonList.isNotEmpty) {
+            final firstUrl = jsonList.first['url'] as String?;
+            if (firstUrl != null && firstUrl.isNotEmpty) {
+              LoggerService.d('[Splash] 2/2 🔥 Stealth Pre-Warming Hardware Decoder for: $firstUrl');
+              final warmStart = DateTime.now();
+              
+              // We do not wait for the video to fully download, we just force the 
+              // hardware decoder to allocate memory and init the Extractor.
+              await VideoControllerPool.instance
+                  .getControllerFor(firstUrl)
+                  .timeout(const Duration(milliseconds: 1000));
+                  
+              LoggerService.i(
+                '[Splash] ✅ Hardware Decoder Warmed Up '
+                '(${DateTime.now().difference(warmStart).inMilliseconds} ms)',
+              );
+            }
           }
-        }),
-      ]);
-
-      if (!timedOut) {
-        LoggerService.i(
-          '[Splash] ✅ Parallel phase complete '
-          '(${DateTime.now().difference(parallelStart).inMilliseconds} ms)',
-        );
+        }
+      } catch (e) {
+        // If the stealth prewarm fails (slow internet, corrupted cache, etc),
+        // we silently swallow it so the app still boots successfully.
+        if (e is TimeoutException) {
+          LoggerService.w('[Splash] ⏱ Pre-warm hardware timeout (Skipping gracefully).');
+        } else {
+          LoggerService.w('[Splash] ⚠️ Pre-warm hardware skipped: $e');
+        }
       }
+
     } catch (e) {
       LoggerService.e('[Splash] ❌ Bootstrap error: $e');
     }
@@ -158,3 +150,4 @@ class _SplashScreenState extends State<SplashScreen>
     );
   }
 }
+

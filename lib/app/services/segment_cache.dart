@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import 'package:path_provider/path_provider.dart';
 
-import '../utils/fnv_hash.dart';
+import 'fnv_hash.dart';
 import '../services/logger_service.dart';
 
 /// LRU cache with both in-memory (fast) and on-disk (persistent) tiers.
@@ -42,7 +42,16 @@ class SegmentCache {
   /// Must be called once before any [get] / [put] operations.
   Future<void> init() async {
     if (_initialized) return;
-    final dir = await getTemporaryDirectory();
+    // ⚠️ CRITICAL: Use getApplicationSupportDirectory() NOT getTemporaryDirectory().
+    //
+    // getTemporaryDirectory() is a volatile OS scratch-pad. The OS legally 
+    // wipes it wholesale on low-memory events, app kill, and device restart.
+    // Every video the user watches gets silently deleted, breaking offline playback.
+    //
+    // getApplicationSupportDirectory() is a permanent, private, app-specific
+    // folder that persists across restarts, updates, and low-memory conditions.
+    // iOS / Android never clear it without the user explicitly deleting the app.
+    final dir = await getApplicationSupportDirectory();
     _cacheDir = '${dir.path}/hls_cache';
     await Directory(_cacheDir).create(recursive: true);
     await _scanExistingCache();
@@ -214,7 +223,10 @@ class SegmentCache {
       // Ensure the cache directory still exists (OS may wipe temp dirs)
       await Directory(_cacheDir).create(recursive: true);
       // Atomic write: Write to .tmp then rename
-      await tmpFile.writeAsBytes(data, flush: true);
+      // ZERO-TOLERANCE OS OPTIMIZATION: 
+      // flush: false drops the memory directly into the OS's hyper-fast Page Cache
+      // and returns instantly. It will lazily fsync in the background, freeing the Dart thread.
+      await tmpFile.writeAsBytes(data, flush: false);
       await tmpFile.rename(path);
     } catch (e) {
       LoggerService.e('[SegmentCache] Atomic write failed for $key: $e');
